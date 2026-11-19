@@ -1,44 +1,50 @@
 // Fairlight FX bridge for DaVinci Resolve on Linux.
 //
-// Stage 3a: our own vtable sits in the call path, and QueryPluginList is instrumented.
+// Stage 3a: our own vtable sits in the call path, and QueryPluginList is
+// instrumented.
 //
-// Resolve's Fairlight page loads exactly one audio-plugin library. FLPluginHost::Initialize()
-// reads the config key "BMDPlugins.Path" (from configs/config-fairlight.dat), and when that key
-// holds a path it loads that file instead of the stock /opt/resolve/libs/libBMDAudioPlugins.so.
-// It then resolves the unmangled entry point GetBMDPluginInterface, calls it with no arguments,
-// and requires vtable slot 0 (GetPluginInterfaceVersion) to return exactly 100.
+// Resolve's Fairlight page loads exactly one audio-plugin library.
+// FLPluginHost::Initialize() reads the config key "BMDPlugins.Path" (from
+// configs/config-fairlight.dat), and when that key holds a path it loads that
+// file instead of the stock /opt/resolve/libs/libBMDAudioPlugins.so. It then
+// resolves the unmangled entry point GetBMDPluginInterface, calls it with no
+// arguments, and requires vtable slot 0 (GetPluginInterfaceVersion) to return
+// exactly 100.
 //
-// The override is exclusive: when we are loaded, the stock library is not. So we load the stock
-// library ourselves, take its bmd::PluginInterface, and repoint the object at a vtable we own.
-// Two slots become trampolines; the other four keep the stock addresses. Nothing changes yet —
-// the trampolines record the call and tail-jump to the original.
+// The override is exclusive: when we are loaded, the stock library is not. So
+// we load the stock library ourselves, take its bmd::PluginInterface, and
+// repoint the object at a vtable we own. Two slots become trampolines; the
+// other four keep the stock addresses. Nothing changes yet — the trampolines
+// record the call and tail-jump to the original.
 //
-// The trampolines are written in assembly on purpose. QueryPluginList and CreatePluginInstance
-// return C++ objects whose exact types we have not recovered, so a returned value may travel
-// through a hidden sret pointer. A tail jump forwards every calling convention untouched; a C++
-// wrapper with a guessed signature would not.
+// The trampolines are written in assembly on purpose. QueryPluginList and
+// CreatePluginInstance return C++ objects whose exact types we have not
+// recovered, so a returned value may travel through a hidden sret pointer. A
+// tail jump forwards every calling convention untouched; a C++ wrapper with a
+// guessed signature would not.
 //
-// To recover the plugin-list type, the QueryPluginList trampoline logs its argument registers,
-// calls the stock function, and logs what comes back. Whether the first argument is `this` or a
-// hidden sret pointer decides the convention, and we know the interface address to compare it
-// against. Reads of returned memory go through process_vm_readv, which reports EFAULT instead of
+// To recover the plugin-list type, the QueryPluginList trampoline logs its
+// argument registers, calls the stock function, and logs what comes back.
+// Whether the first argument is `this` or a hidden sret pointer decides the
+// convention, and we know the interface address to compare it against. Reads of
+// returned memory go through process_vm_readv, which reports EFAULT instead of
 // faulting, so a wrong guess about a pointer cannot take Resolve down.
 
 #include "carla_host.h"
 #include "chain_lock_fix.h"
+#include "fx_categories.h"
+#include "host_thread.h"
 #include "member_layout.h"
 #include "plugin_instance.h"
-#include "fx_categories.h"
 #include "plugin_scan.h"
-#include "plugin_window.h"
 #include "plugin_state.h"
-#include "host_thread.h"
+#include "plugin_window.h"
 
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
-#include <execinfo.h>
 
 #include <cerrno>
 #include <csignal>
@@ -46,227 +52,231 @@
 #include <cstring>
 #include <ctime>
 
-#include <cstdarg>
-#include <cstdint>
-#include <cstdlib>
-#include <cstdio>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace {
 
-constexpr const char* kStockLibrary = "/opt/resolve/libs/libBMDAudioPlugins.so";
-constexpr const char* kEntryPoint = "GetBMDPluginInterface";
+constexpr const char *kStockLibrary = "/opt/resolve/libs/libBMDAudioPlugins.so";
+constexpr const char *kEntryPoint = "GetBMDPluginInterface";
 
-// bmd::PluginInterface, read from the relocations of `vtable for BMDPluginInterfaceImpl`.
+// bmd::PluginInterface, read from the relocations of `vtable for
+// BMDPluginInterfaceImpl`.
 enum Slot {
-    kGetPluginInterfaceVersion = 0,
-    kQueryPluginList = 1,
-    kCreatePluginInstance = 2,
-    kSetAudioPluginHost = 3,
-    kSetPluginUserInterfaceHost = 4,
-    kQueryMacroFXResourceList = 5,
-    kSlotCount = 6,
+  kGetPluginInterfaceVersion = 0,
+  kQueryPluginList = 1,
+  kCreatePluginInstance = 2,
+  kSetAudioPluginHost = 3,
+  kSetPluginUserInterfaceHost = 4,
+  kQueryMacroFXResourceList = 5,
+  kSlotCount = 6,
 };
 
 constexpr int kExpectedInterfaceVersion = 100;
 
-using EntryPointFn = void* (*)();
-using GetVersionFn = int (*)(const void*);
+using EntryPointFn = void *(*)();
+using GetVersionFn = int (*)(const void *);
 
-void Log(const char* format, ...) __attribute__((format(printf, 1, 2)));
+void Log(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
-void Log(const char* format, ...)
-{
-    va_list args;
-    va_start(args, format);
-    std::fputs("[fxbridge] ", stderr);
-    std::vfprintf(stderr, format, args);
-    std::fputc('\n', stderr);
-    std::fflush(stderr);
-    va_end(args);
+void Log(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  std::fputs("[fxbridge] ", stderr);
+  std::vfprintf(stderr, format, args);
+  std::fputc('\n', stderr);
+  std::fflush(stderr);
+  va_end(args);
 }
-
 
 // ---------------------------------------------------------------------------
 // The fault handler.
 //
-// Two project loads died on 2026-08-29 with the parameter probe on, and neither left a core to
-// read: core_pattern pipes to systemd-coredump, which drops a process this size. So both crashes
-// were diagnosed by guessing, and the first guess was wrong - NotifyParameterUpdate was blamed,
-// and then the second crash happened with that switched off. Guessing twice is enough.
+// Two project loads died on 2026-08-29 with the parameter probe on, and neither
+// left a core to read: core_pattern pipes to systemd-coredump, which drops a
+// process this size. So both crashes were diagnosed by guessing, and the first
+// guess was wrong - NotifyParameterUpdate was blamed, and then the second crash
+// happened with that switched off. Guessing twice is enough.
 //
-// It runs on its own stack so a stack overflow still reports, formats by hand and writes with
-// write() rather than through the logger - a crash inside malloc would deadlock in vfprintf -
-// and then restores the previous handler and re-raises, so Resolve's own reporting still gets
-// its turn. It costs nothing until something faults.
+// It runs on its own stack so a stack overflow still reports, formats by hand
+// and writes with write() rather than through the logger - a crash inside
+// malloc would deadlock in vfprintf - and then restores the previous handler
+// and re-raises, so Resolve's own reporting still gets its turn. It costs
+// nothing until something faults.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 constexpr int kFatalSignals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE};
-constexpr size_t kFatalSignalCount = sizeof(kFatalSignals) / sizeof(kFatalSignals[0]);
+constexpr size_t kFatalSignalCount =
+    sizeof(kFatalSignals) / sizeof(kFatalSignals[0]);
 struct sigaction g_previous_handler[kFatalSignalCount];
 char g_fault_stack[256 * 1024];
 
-void WriteText(const char* text)
-{
-    if (text == nullptr) {
-        return;
-    }
-    const ssize_t written = write(STDERR_FILENO, text, std::strlen(text));
-    (void)written;
+void WriteText(const char *text) {
+  if (text == nullptr) {
+    return;
+  }
+  const ssize_t written = write(STDERR_FILENO, text, std::strlen(text));
+  (void)written;
 }
 
-void WriteHex(unsigned long value)
-{
-    char digits[19] = {'0', 'x'};
-    size_t at = 2;
-    bool started = false;
-    for (int shift = 60; shift >= 0; shift -= 4) {
-        const unsigned nibble = static_cast<unsigned>((value >> shift) & 0xf);
-        if (nibble != 0 || started || shift == 0) {
-            started = true;
-            digits[at++] = static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + nibble - 10);
-        }
+void WriteHex(unsigned long value) {
+  char digits[19] = {'0', 'x'};
+  size_t at = 2;
+  bool started = false;
+  for (int shift = 60; shift >= 0; shift -= 4) {
+    const unsigned nibble = static_cast<unsigned>((value >> shift) & 0xf);
+    if (nibble != 0 || started || shift == 0) {
+      started = true;
+      digits[at++] =
+          static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + nibble - 10);
     }
-    digits[at] = '\0';
-    WriteText(digits);
+  }
+  digits[at] = '\0';
+  WriteText(digits);
 }
 
-void OnFatalSignal(int number, siginfo_t* info, void* context)
-{
-    (void)context;
-    WriteText("[fxbridge] crash: signal ");
-    WriteHex(static_cast<unsigned long>(number));
-    WriteText(" at ");
-    WriteHex(info != nullptr ? reinterpret_cast<unsigned long>(info->si_addr) : 0);
-    WriteText("\n[fxbridge] crash: backtrace follows, innermost first\n");
+void OnFatalSignal(int number, siginfo_t *info, void *context) {
+  (void)context;
+  WriteText("[fxbridge] crash: signal ");
+  WriteHex(static_cast<unsigned long>(number));
+  WriteText(" at ");
+  WriteHex(info != nullptr ? reinterpret_cast<unsigned long>(info->si_addr)
+                           : 0);
+  WriteText("\n[fxbridge] crash: backtrace follows, innermost first\n");
 
-    void* frames[64];
-    const int count = backtrace(frames, 64);
-    backtrace_symbols_fd(frames, count, STDERR_FILENO);
-    WriteText("[fxbridge] crash: end of backtrace\n");
+  void *frames[64];
+  const int count = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, count, STDERR_FILENO);
+  WriteText("[fxbridge] crash: end of backtrace\n");
 
-    for (size_t index = 0; index < kFatalSignalCount; ++index) {
-        sigaction(kFatalSignals[index], &g_previous_handler[index], nullptr);
-    }
-    raise(number);
+  for (size_t index = 0; index < kFatalSignalCount; ++index) {
+    sigaction(kFatalSignals[index], &g_previous_handler[index], nullptr);
+  }
+  raise(number);
 }
 
-void InstallFaultHandler()
-{
-    stack_t stack = {};
-    stack.ss_sp = g_fault_stack;
-    stack.ss_size = sizeof(g_fault_stack);
-    stack.ss_flags = 0;
-    sigaltstack(&stack, nullptr);
+void InstallFaultHandler() {
+  stack_t stack = {};
+  stack.ss_sp = g_fault_stack;
+  stack.ss_size = sizeof(g_fault_stack);
+  stack.ss_flags = 0;
+  sigaltstack(&stack, nullptr);
 
-    struct sigaction action = {};
-    action.sa_sigaction = &OnFatalSignal;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
-    sigemptyset(&action.sa_mask);
-    for (size_t index = 0; index < kFatalSignalCount; ++index) {
-        sigaction(kFatalSignals[index], &action, &g_previous_handler[index]);
-    }
-    Log("crash handler installed on %zu signals", kFatalSignalCount);
+  struct sigaction action = {};
+  action.sa_sigaction = &OnFatalSignal;
+  action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
+  sigemptyset(&action.sa_mask);
+  for (size_t index = 0; index < kFatalSignalCount; ++index) {
+    sigaction(kFatalSignals[index], &action, &g_previous_handler[index]);
+  }
+  Log("crash handler installed on %zu signals", kFatalSignalCount);
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Which host runs.
 //
-// FXBRIDGE_HOST=carla puts Carla in the chain instead of the CLAP host. Carla loads VST2, VST3,
-// LV2, CLAP and AU itself, and a Windows plugin bridged by yabridge presents as a native VST2 or
-// VST3 - so one host reaches every format, and its patchbay is the patcher. FXBRIDGE_CARLA_MODE
-// picks "rack" (a serial chain, the default) or "patchbay" (arbitrary routing).
+// FXBRIDGE_HOST=carla puts Carla in the chain instead of the CLAP host. Carla
+// loads VST2, VST3, LV2, CLAP and AU itself, and a Windows plugin bridged by
+// yabridge presents as a native VST2 or VST3 - so one host reaches every
+// format, and its patchbay is the patcher. FXBRIDGE_CARLA_MODE picks "rack" (a
+// serial chain, the default) or "patchbay" (arbitrary routing).
 //
-// The CLAP host stays the default: it is direct, it has no second process, and it is the one that
-// has been exercised.
+// The CLAP host stays the default: it is direct, it has no second process, and
+// it is the one that has been exercised.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-// Which loader is behind the wrapper. Everything below this line is the same for all of them:
-// the Fairlight carrier, the vtable claim, the editor visibility owner and the window.
+// Which loader is behind the wrapper. Everything below this line is the same
+// for all of them: the Fairlight carrier, the vtable claim, the editor
+// visibility owner and the window.
 enum class Loader { Clap, Carla, Vst2 };
 
-Loader SelectedLoader()
-{
-    const char* const host = std::getenv("FXBRIDGE_HOST");
-    if (host == nullptr) {
-        return Loader::Clap;
-    }
-    if (std::strcmp(host, "carla") == 0) {
-        return Loader::Carla;
-    }
-    if (std::strcmp(host, "vst2") == 0) {
-        return Loader::Vst2;
-    }
+Loader SelectedLoader() {
+  const char *const host = std::getenv("FXBRIDGE_HOST");
+  if (host == nullptr) {
     return Loader::Clap;
+  }
+  if (std::strcmp(host, "carla") == 0) {
+    return Loader::Carla;
+  }
+  if (std::strcmp(host, "vst2") == 0) {
+    return Loader::Vst2;
+  }
+  return Loader::Clap;
 }
 
-bool UsingCarla() { return SelectedLoader() == Loader::Carla; }
-bool UsingVst2() { return SelectedLoader() == Loader::Vst2; }
+[[maybe_unused]] bool UsingCarla() { return SelectedLoader() == Loader::Carla; }
+[[maybe_unused]] bool UsingVst2() { return SelectedLoader() == Loader::Vst2; }
 
-// Which plugin the configured path names, and what to call it in the menu before anything is
-// loaded. The scanner will replace both: one entry per plugin found, named from the file.
-const char* ConfiguredPluginPath()
-{
-    const char* const vst2 = std::getenv("FXBRIDGE_VST2");
-    if (vst2 != nullptr && vst2[0] != '\0') {
-        return vst2;
-    }
-    const char* const clap = std::getenv("FXBRIDGE_CLAP");
-    if (clap != nullptr && clap[0] != '\0') {
-        return clap;
-    }
-    return "/home/jooshua/.clap/DragonflyHallReverb.clap";
+// Which plugin the configured path names, and what to call it in the menu
+// before anything is loaded. The scanner will replace both: one entry per
+// plugin found, named from the file.
+const char *ConfiguredPluginPath() {
+  const char *const vst2 = std::getenv("FXBRIDGE_VST2");
+  if (vst2 != nullptr && vst2[0] != '\0') {
+    return vst2;
+  }
+  const char *const clap = std::getenv("FXBRIDGE_CLAP");
+  if (clap != nullptr && clap[0] != '\0') {
+    return clap;
+  }
+  return "/home/jooshua/.clap/DragonflyHallReverb.clap";
 }
 
-// The file's own name, with its directory and extension removed. Reading it costs nothing, while
-// loading a plugin to ask its name can start a Wine process.
-const char* MenuNameFromPath(const char* path)
-{
-    static char name[128];
-    const char* const slash = std::strrchr(path, '/');
-    std::snprintf(name, sizeof(name), "%s", slash != nullptr ? slash + 1 : path);
-    char* const dot = std::strrchr(name, '.');
-    if (dot != nullptr) {
-        *dot = '\0';
-    }
-    return name;
+// The file's own name, with its directory and extension removed. Reading it
+// costs nothing, while loading a plugin to ask its name can start a Wine
+// process.
+const char *MenuNameFromPath(const char *path) {
+  static char name[128];
+  const char *const slash = std::strrchr(path, '/');
+  std::snprintf(name, sizeof(name), "%s", slash != nullptr ? slash + 1 : path);
+  char *const dot = std::strrchr(name, '.');
+  if (dot != nullptr) {
+    *dot = '\0';
+  }
+  return name;
 }
 
-}  // namespace
+} // namespace
 
-// The limits the audio path works within. Declared here because the per-effect registry below
-// sizes its buffers from them.
+// The limits the audio path works within. Declared here because the per-effect
+// registry below sizes its buffers from them.
 namespace {
 constexpr unsigned long kMaxFrames = 8192;
 constexpr unsigned int kMaxChannels = 16;
 
-// Written one sample past every block handed to a plugin, and read back afterwards. A plugin that
-// writes more than it was asked for is a real failure mode, not a theory - see BridgeAfterProcess.
+// Written one sample past every block handed to a plugin, and read back
+// afterwards. A plugin that writes more than it was asked for is a real failure
+// mode, not a theory - see BridgeAfterProcess.
 constexpr float kOverrunMarker = -1234.5f;
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // One plugin per effect.
 //
-// The audio path holds no shared state. Each claimed effect owns its plugin and its dry buffer,
-// and a lookup on the audio thread is a linear scan over a fixed array with an atomic count -
-// entries are appended under a lock and never removed, so a reader never waits and never sees a
-// half-written entry.
+// The audio path holds no shared state. Each claimed effect owns its plugin and
+// its dry buffer, and a lookup on the audio thread is a linear scan over a
+// fixed array with an atomic count - entries are appended under a lock and
+// never removed, so a reader never waits and never sees a half-written entry.
 //
-// This replaces one global dry buffer, two global counters and one shared plugin. Resolve renders
-// on several threads, so with more than one effect those globals were written by two threads at
-// once and the same non-re-entrant plugin was called from both. Every crash inside Resolve came
-// back to BridgeAfterProcess, and it only ever appeared once a project carried a second effect.
+// This replaces one global dry buffer, two global counters and one shared
+// plugin. Resolve renders on several threads, so with more than one effect
+// those globals were written by two threads at once and the same non-re-entrant
+// plugin was called from both. Every crash inside Resolve came back to
+// BridgeAfterProcess, and it only ever appeared once a project carried a second
+// effect.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -275,148 +285,155 @@ constexpr size_t kMaxClaimedEffects = 64;
 
 // How many parameters the probe adds on top of the ones the carrier owns.
 //
-// Four is enough to tell a restored value from a default, and small enough that the cost of
-// being wrong is four indices Resolve asks about and nothing answers. See the probe section.
+// Four is enough to tell a restored value from a default, and small enough that
+// the cost of being wrong is four indices Resolve asks about and nothing
+// answers. See the probe section.
 constexpr unsigned int kProbeParameters = 4;
 
 struct ClaimedEffect {
-    // Resolve may call us with either the bmd::PluginInstance subobject or the AudioPlugin one,
-    // so both addresses map to the same effect.
-    void* instance_key = nullptr;
-    void* audio_plugin_key = nullptr;
-    HostedPlugin* plugin = nullptr;
+  // Resolve may call us with either the bmd::PluginInstance subobject or the
+  // AudioPlugin one, so both addresses map to the same effect.
+  void *instance_key = nullptr;
+  void *audio_plugin_key = nullptr;
+  HostedPlugin *plugin = nullptr;
 
-    // Set when Resolve says the playhead jumped, consumed by the next Process.
-    //
-    // The reset is not done where Resolve asks for it. ResetHistory arrives on whatever thread
-    // Resolve happens to call it from, and doing the work there could land inside a Process
-    // running on another thread. Deferring it to the top of the next Process puts it on the audio
-    // thread, in the one place no Process is in flight - which is where all three formats agree a
-    // reset belongs.
-    std::atomic<bool> reset_pending{false};
+  // Set when Resolve says the playhead jumped, consumed by the next Process.
+  //
+  // The reset is not done where Resolve asks for it. ResetHistory arrives on
+  // whatever thread Resolve happens to call it from, and doing the work there
+  // could land inside a Process running on another thread. Deferring it to the
+  // top of the next Process puts it on the audio thread, in the one place no
+  // Process is in flight - which is where all three formats agree a reset
+  // belongs.
+  std::atomic<bool> reset_pending{false};
 
-    // What we last told Resolve this effect's latency is, so the log carries a line when it
-    // changes and stays quiet when it does not.
-    long long reported_latency = -1;
+  // What we last told Resolve this effect's latency is, so the log carries a
+  // line when it changes and stays quiet when it does not.
+  long long reported_latency = -1;
 
-    // The watchdog on the hosted call. See ReportSlowBlock for why it exists.
-    std::atomic<unsigned int> slow_blocks{0};
-    long long worst_block_us = 0;
-    std::vector<float> dry;
-    // Stand-in buffers for channels Resolve does not provide, so a stereo plugin can still run on
-    // a mono track. Allocated at claim time; never on the audio thread.
-    std::vector<float> spare;
-    float* channels[kMaxChannels] = {nullptr};
-    unsigned long dry_frames = 0;
-    unsigned int dry_channels = 0;
+  // The watchdog on the hosted call. See ReportSlowBlock for why it exists.
+  std::atomic<unsigned int> slow_blocks{0};
+  long long worst_block_us = 0;
+  std::vector<float> dry;
+  // Stand-in buffers for channels Resolve does not provide, so a stereo plugin
+  // can still run on a mono track. Allocated at claim time; never on the audio
+  // thread.
+  std::vector<float> spare;
+  float *channels[kMaxChannels] = {nullptr};
+  unsigned long dry_frames = 0;
+  unsigned int dry_channels = 0;
 
-    // This effect's own name, in both encodings Resolve asks for. Held per effect and not in one
-    // shared buffer, because the name hooks return the pointer they are given: with a shared
-    // buffer, a second effect with a second plugin would rename the first one.
-    char label_narrow[128] = {0};
-    wchar_t label_wide[128] = {0};
+  // This effect's own name, in both encodings Resolve asks for. Held per effect
+  // and not in one shared buffer, because the name hooks return the pointer
+  // they are given: with a shared buffer, a second effect with a second plugin
+  // would rename the first one.
+  char label_narrow[128] = {0};
+  wchar_t label_wide[128] = {0};
 
-    // This effect's editor, not the bridge's. See BridgeEditorShowFor.
-    std::atomic<bool> editor_wanted{false};
-    std::atomic<bool> editor_shown{false};
+  // This effect's editor, not the bridge's. See BridgeEditorShowFor.
+  std::atomic<bool> editor_wanted{false};
+  std::atomic<bool> editor_shown{false};
 
-    // The BMDAudioPluginImpl base, which is where Resolve keeps this effect's channel counts.
-    void* primary_base = nullptr;
+  // The BMDAudioPluginImpl base, which is where Resolve keeps this effect's
+  // channel counts.
+  void *primary_base = nullptr;
 
-    // Where this effect's settings are stored, and what was last written there. Both are
-    // empty unless FXBRIDGE_STATE_STORE=1. The copy is what makes the periodic save cheap:
-    // an unchanged plugin costs one comparison and no file.
-    std::string state_base;
-    std::string state_key;
-    std::vector<uint8_t> state_last;
-    // When the settings this effect is currently wearing were written, in seconds since the epoch.
-    // Zero means nothing was restored. It decides between the file store and the project when both
-    // carry something - see TakeAttachedChunk.
-    uint64_t state_stamp = 0;
-    bool state_said_gone = false;
-    bool state_said_mute = false;
+  // Where this effect's settings are stored, and what was last written there.
+  // Both are empty unless FXBRIDGE_STATE_STORE=1. The copy is what makes the
+  // periodic save cheap: an unchanged plugin costs one comparison and no file.
+  std::string state_base;
+  std::string state_key;
+  std::vector<uint8_t> state_last;
+  // When the settings this effect is currently wearing were written, in seconds
+  // since the epoch. Zero means nothing was restored. It decides between the
+  // file store and the project when both carry something - see
+  // TakeAttachedChunk.
+  uint64_t state_stamp = 0;
+  bool state_said_gone = false;
+  bool state_said_mute = false;
 
-    // The parameter probe. Empty unless FXBRIDGE_PARAM_PROBE=1.
-    //
-    // stock_params is what the carrier answered before we added anything, measured once and
-    // then fixed: every index at or above it belongs to the probe and to nothing else, so a
-    // value that arrives on one of them came out of Resolve's own store.
-    unsigned int stock_params = 0;
-    float probe[kProbeParameters] = {0.0f, 0.0f, 0.0f, 0.0f};
-    bool probe_notified = false;
+  // The parameter probe. Empty unless FXBRIDGE_PARAM_PROBE=1.
+  //
+  // stock_params is what the carrier answered before we added anything,
+  // measured once and then fixed: every index at or above it belongs to the
+  // probe and to nothing else, so a value that arrives on one of them came out
+  // of Resolve's own store.
+  unsigned int stock_params = 0;
+  float probe[kProbeParameters] = {0.0f, 0.0f, 0.0f, 0.0f};
+  bool probe_notified = false;
 };
 
 // Fills both encodings from one name.
-void SetEffectLabel(ClaimedEffect* effect, const char* name)
-{
-    if (effect == nullptr || name == nullptr || name[0] == '\0') {
-        return;
-    }
-    std::snprintf(effect->label_narrow, sizeof(effect->label_narrow), "%s", name);
-    size_t index = 0;
-    const size_t limit = sizeof(effect->label_wide) / sizeof(effect->label_wide[0]);
-    for (; index + 1 < limit && name[index] != '\0'; ++index) {
-        effect->label_wide[index] = static_cast<wchar_t>(name[index]);
-    }
-    effect->label_wide[index] = 0;
+void SetEffectLabel(ClaimedEffect *effect, const char *name) {
+  if (effect == nullptr || name == nullptr || name[0] == '\0') {
+    return;
+  }
+  std::snprintf(effect->label_narrow, sizeof(effect->label_narrow), "%s", name);
+  size_t index = 0;
+  const size_t limit =
+      sizeof(effect->label_wide) / sizeof(effect->label_wide[0]);
+  for (; index + 1 < limit && name[index] != '\0'; ++index) {
+    effect->label_wide[index] = static_cast<wchar_t>(name[index]);
+  }
+  effect->label_wide[index] = 0;
 }
 
 ClaimedEffect g_effects[kMaxClaimedEffects];
 std::atomic<size_t> g_effect_count{0};
 
-// Saves every effect's settings on the host main thread, about every ten seconds.
+// Saves every effect's settings on the host main thread, about every ten
+// seconds.
 //
-// There is no moment to save at. Resolve never tells the bridge that an effect is going
-// away - g_effect_count only ever grows - so a project close, a project switch and a quit
-// all look the same from here: nothing. A snapshot on a timer is what remains, and it has
-// one property the hooks would not: it survives a Resolve that crashes.
+// There is no moment to save at. Resolve never tells the bridge that an effect
+// is going away - g_effect_count only ever grows - so a project close, a
+// project switch and a quit all look the same from here: nothing. A snapshot on
+// a timer is what remains, and it has one property the hooks would not: it
+// survives a Resolve that crashes.
 //
-// It runs on the host main thread rather than the window pump because that is the thread
-// this bridge already treats as a plugin's main thread - VST2 effEditIdle goes out on it.
+// It runs on the host main thread rather than the window pump because that is
+// the thread this bridge already treats as a plugin's main thread - VST2
+// effEditIdle goes out on it.
 //
-// A project switch does force a pass, but indirectly, and the indirection is the point. The
-// switch is visible here: Resolve closes the old project and then claims the new project's
-// effects. Saving from that claim would be saving from Resolve's main thread, underneath
-// StudioModel::Deserialize - and a synchronous round trip into a yabridge plugin from that
-// thread is the deadlock that cost v0.1.1. So the claim only raises a flag, and this thread
-// does the work on its next tick, about 16 ms later. The outgoing project's effects are
-// still in the array with their final settings, because nothing ever removes them.
+// A project switch does force a pass, but indirectly, and the indirection is
+// the point. The switch is visible here: Resolve closes the old project and
+// then claims the new project's effects. Saving from that claim would be saving
+// from Resolve's main thread, underneath StudioModel::Deserialize - and a
+// synchronous round trip into a yabridge plugin from that thread is the
+// deadlock that cost v0.1.1. So the claim only raises a flag, and this thread
+// does the work on its next tick, about 16 ms later. The outgoing project's
+// effects are still in the array with their final settings, because nothing
+// ever removes them.
 std::mutex g_effect_append_lock;
 
-// The effect whose editor Resolve last opened. The window is shared, so one editor shows at a time.
-std::atomic<ClaimedEffect*> g_focused_effect{nullptr};
-
-ClaimedEffect* FindEffect(const void* key)
-{
-    const size_t count = g_effect_count.load(std::memory_order_acquire);
-    for (size_t index = 0; index < count; ++index) {
-        ClaimedEffect& effect = g_effects[index];
-        if (effect.instance_key == key || effect.audio_plugin_key == key) {
-            return &effect;
-        }
+ClaimedEffect *FindEffect(const void *key) {
+  const size_t count = g_effect_count.load(std::memory_order_acquire);
+  for (size_t index = 0; index < count; ++index) {
+    ClaimedEffect &effect = g_effects[index];
+    if (effect.instance_key == key || effect.audio_plugin_key == key) {
+      return &effect;
     }
-    return nullptr;
+  }
+  return nullptr;
 }
 
 // The same lookup, and the BMDAudioPluginImpl base as well.
 //
-// A slot in the primary vtable group arrives with `this` pointing at the impl base, which is
-// sixteen bytes BELOW the pointer CreatePluginInstance returned, so FindEffect misses it. The
-// editor hooks got away with that because they fall back to the focused effect. A parameter
-// call cannot: the answer belongs to one effect and would be wrong for any other.
-ClaimedEffect* FindEffectAny(const void* key)
-{
-    ClaimedEffect* const known = FindEffect(key);
-    if (known != nullptr) {
-        return known;
+// A slot in the primary vtable group arrives with `this` pointing at the impl
+// base, which is sixteen bytes BELOW the pointer CreatePluginInstance returned,
+// so FindEffect misses it. Include the primary base for calls that must be
+// associated with a specific effect.
+ClaimedEffect *FindEffectAny(const void *key) {
+  ClaimedEffect *const known = FindEffect(key);
+  if (known != nullptr) {
+    return known;
+  }
+  const size_t count = g_effect_count.load(std::memory_order_acquire);
+  for (size_t index = 0; index < count; ++index) {
+    if (g_effects[index].primary_base == key) {
+      return &g_effects[index];
     }
-    const size_t count = g_effect_count.load(std::memory_order_acquire);
-    for (size_t index = 0; index < count; ++index) {
-        if (g_effects[index].primary_base == key) {
-            return &g_effects[index];
-        }
-    }
-    return nullptr;
+  }
+  return nullptr;
 }
 
 // Set once, in PatchDelayClassVtable, from FXBRIDGE_PARAM_PROBE.
@@ -430,218 +447,225 @@ constexpr size_t kNotifyParameterUpdateOffset = 0x0c0;
 
 // What this run seeds the four probe parameters with.
 //
-// It has to differ between runs, or the test proves nothing: our own GetParameterValue answers
-// with the seed, so a value pushed back in the same session could be Resolve echoing what it
-// just read. Give run one FXBRIDGE_PROBE_SEED=0.111 and run two 0.777, and a 0.111 arriving in
-// run two came out of the project file and out of nowhere else.
+// It has to differ between runs, or the test proves nothing: our own
+// GetParameterValue answers with the seed, so a value pushed back in the same
+// session could be Resolve echoing what it just read. Give run one
+// FXBRIDGE_PROBE_SEED=0.111 and run two 0.777, and a 0.111 arriving in run two
+// came out of the project file and out of nowhere else.
 float g_probe_seed = 0.125f;
 
-float ProbeSeed(unsigned int slot)
-{
-    return g_probe_seed + static_cast<float>(slot) * 0.01f;
+float ProbeSeed(unsigned int slot) {
+  return g_probe_seed + static_cast<float>(slot) * 0.01f;
 }
 
-ClaimedEffect* AppendEffect(void* instance_key, void* audio_plugin_key)
-{
-    const std::lock_guard<std::mutex> guard(g_effect_append_lock);
-    const size_t count = g_effect_count.load(std::memory_order_relaxed);
-    if (count >= kMaxClaimedEffects) {
-        return nullptr;
-    }
-    ClaimedEffect& effect = g_effects[count];
-    effect.instance_key = instance_key;
-    effect.audio_plugin_key = audio_plugin_key;
-    // Published last: a reader that sees the new count sees a complete entry.
-    g_effect_count.store(count + 1, std::memory_order_release);
-    return &effect;
+ClaimedEffect *AppendEffect(void *instance_key, void *audio_plugin_key) {
+  const std::lock_guard<std::mutex> guard(g_effect_append_lock);
+  const size_t count = g_effect_count.load(std::memory_order_relaxed);
+  if (count >= kMaxClaimedEffects) {
+    return nullptr;
+  }
+  ClaimedEffect &effect = g_effects[count];
+  effect.instance_key = instance_key;
+  effect.audio_plugin_key = audio_plugin_key;
+  // Published last: a reader that sees the new count sees a complete entry.
+  g_effect_count.store(count + 1, std::memory_order_release);
+  return &effect;
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Editor visibility.
 //
-// One place decides whether the hosted window should be on screen, for every host. Before this,
-// each host was wired separately - the CLAP window through Resolve's editor calls, the Carla window
-// through a claim-time open - so every new host needed its own fix and a change to one broke the
-// other.
+// One place decides whether the hosted window should be on screen, for every
+// host. Before this, each host was wired separately - the CLAP window through
+// Resolve's editor calls, the Carla window through a claim-time open - so every
+// new host needed its own fix and a change to one broke the other.
 //
 // Two rules, and they are what makes it self-healing:
 //
-//   * Any signal that means "the user is looking at this effect" asks for the window. Asking twice
-//     is free, because both hosts remap an existing window instead of building a second one.
-//   * The state is re-asserted on the idle tick. If the window went away without telling us - a
-//     window manager, a host that dropped it - the next tick puts it back, rather than leaving a
-//     button that does nothing.
+//   * Any signal that means "the user is looking at this effect" asks for the
+//   window. Asking twice
+//     is free, because both hosts remap an existing window instead of building
+//     a second one.
+//   * The state is re-asserted on the idle tick. If the window went away
+//   without telling us - a
+//     window manager, a host that dropped it - the next tick puts it back,
+//     rather than leaving a button that does nothing.
 //
-// A close that the user performed is remembered, so re-asserting never fights them.
+// A close that the user performed is remembered, so re-asserting never fights
+// them.
 // ---------------------------------------------------------------------------
 
 // The editor belongs to an effect, not to the bridge.
 //
-// This used to be one pair of flags and one call on g_focused_effect, which was right while only
-// one plugin could exist. It is not right now: with two effects in a project, opening the second
-// one's panel remapped the FIRST one's window - visible in the log on 2026-08-25 as
-// "editor remapped" for instance 1 while Resolve was calling InitializeEffectEdit for instance 2.
-// So each hook passes the effect it was called for, and the flags live on that effect.
+// Each hook identifies the owning effect explicitly. A focus-based fallback
+// could remap a different plugin's editor when several effects exist.
 
-ClaimedEffect* EffectOrFocused(void* self)
-{
-    ClaimedEffect* const effect = FindEffect(self);
-    return effect != nullptr ? effect : g_focused_effect.load();
+// Defined further down, next to the state saver that also needs it. Declared
+// here because the editor pump has to know whether an effect still exists
+// before it keeps a window open for it.
+bool EffectIsLive(const ClaimedEffect &effect);
+
+extern "C" void BridgeEditorShowFor(ClaimedEffect *effect,
+                                    const char *because) {
+  if (effect == nullptr || effect->plugin == nullptr) {
+    Log("editor: %s asked for a window and no effect owns it", because);
+    return;
+  }
+  const bool was_shown = effect->editor_shown.exchange(true);
+  effect->editor_wanted.store(true);
+  if (!effect->plugin->OpenEditor()) {
+    effect->editor_shown.store(false);
+    Log("editor: %s asked for the window and the host refused", because);
+    return;
+  }
+  if (!was_shown) {
+    Log("editor: shown (%s)", because);
+  }
 }
 
-// Defined further down, next to the state saver that also needs it. Declared here because the
-// editor pump has to know whether an effect still exists before it keeps a window open for it.
-bool EffectIsLive(const ClaimedEffect& effect);
-
-extern "C" void BridgeEditorShowFor(ClaimedEffect* effect, const char* because)
-{
-    if (effect == nullptr || effect->plugin == nullptr) {
-        Log("editor: %s asked for a window and no effect owns it", because);
-        return;
-    }
-    const bool was_shown = effect->editor_shown.exchange(true);
-    effect->editor_wanted.store(true);
-    if (!effect->plugin->OpenEditor()) {
-        effect->editor_shown.store(false);
-        Log("editor: %s asked for the window and the host refused", because);
-        return;
-    }
-    if (!was_shown) {
-        Log("editor: shown (%s)", because);
-    }
-}
-
-extern "C" void BridgeEditorHideFor(ClaimedEffect* effect, const char* because)
-{
-    if (effect == nullptr || effect->plugin == nullptr) {
-        return;
-    }
-    effect->editor_wanted.store(false);
-    if (effect->editor_shown.exchange(false)) {
-        effect->plugin->CloseEditor();
-        Log("editor: hidden (%s)", because);
-    }
+extern "C" void BridgeEditorHideFor(ClaimedEffect *effect,
+                                    const char *because) {
+  if (effect == nullptr || effect->plugin == nullptr) {
+    return;
+  }
+  effect->editor_wanted.store(false);
+  if (effect->editor_shown.exchange(false)) {
+    effect->plugin->CloseEditor();
+    Log("editor: hidden (%s)", because);
+  }
 }
 
 // The host telling us a window is gone. Not a request to bring it back.
 //
-// Only the effect that owns the window is marked closed. Every effect used to be marked, and the
-// comment here said that was harmless because nothing acted on the flag by itself. That stopped
-// being true in v0.1.1, when the window pump gained BridgeEditorReassert: from then on, closing
-// one editor made the re-assert loop forget every other open editor as well, and the flags never
-// came back on their own. Reported by Delirio on 2026-08-27 as an editor that will not
-// reopen until the plugin is deleted and added again.
+// Only the effect that owns the window is marked closed. Every effect used to
+// be marked, and the comment here said that was harmless because nothing acted
+// on the flag by itself. That stopped being true in v0.1.1, when the window
+// pump gained BridgeEditorReassert: from then on, closing one editor made the
+// re-assert loop forget every other open editor as well, and the flags never
+// came back on their own. Reported by Delirio on 2026-08-27 as an editor that
+// will not reopen until the plugin is deleted and added again.
 //
-// A window with no owner still clears everything. The alternative is a wanted flag left set on an
-// effect whose window is already gone, and the re-assert loop would then reopen it against the
-// user - the one failure here that cannot be clicked away.
-extern "C" void BridgeEditorWasClosedByUser(unsigned long window)
-{
-    const size_t count = g_effect_count.load();
-    for (size_t index = 0; index < count; ++index) {
-        ClaimedEffect& effect = g_effects[index];
-        if (window == 0 || effect.plugin == nullptr || effect.plugin->EditorWindow() != window) {
-            continue;
-        }
-        effect.editor_wanted.store(false);
-        effect.editor_shown.store(false);
-        return;
+// A window with no owner still clears everything. The alternative is a wanted
+// flag left set on an effect whose window is already gone, and the re-assert
+// loop would then reopen it against the user - the one failure here that cannot
+// be clicked away.
+extern "C" void BridgeEditorWasClosedByUser(unsigned long window) {
+  const size_t count = g_effect_count.load();
+  for (size_t index = 0; index < count; ++index) {
+    ClaimedEffect &effect = g_effects[index];
+    if (window == 0 || effect.plugin == nullptr ||
+        effect.plugin->EditorWindow() != window) {
+      continue;
     }
+    effect.editor_wanted.store(false);
+    effect.editor_shown.store(false);
+    return;
+  }
 
-    Log("editor: window 0x%lx closed and no effect owns it - all editors marked closed", window);
-    for (size_t index = 0; index < count; ++index) {
-        g_effects[index].editor_wanted.store(false);
-        g_effects[index].editor_shown.store(false);
-    }
+  Log("editor: window 0x%lx closed and no effect owns it - all editors marked "
+      "closed",
+      window);
+  for (size_t index = 0; index < count; ++index) {
+    g_effects[index].editor_wanted.store(false);
+    g_effects[index].editor_shown.store(false);
+  }
 }
 
-// Opens any editor that is wanted and not shown. Called from the window pump thread, never from
-// Resolve's main thread: this is what keeps a stalled plugin from freezing the application, and it
-// is also the only path that opens an editor at all once an effect is claimed.
-extern "C" void BridgeEditorReassert()
-{
-    const size_t count = g_effect_count.load();
-    for (size_t index = 0; index < count; ++index) {
-        ClaimedEffect& effect = g_effects[index];
+// Opens any editor that is wanted and not shown. Called from the window pump
+// thread, never from Resolve's main thread: this is what keeps a stalled plugin
+// from freezing the application, and it is also the only path that opens an
+// editor at all once an effect is claimed.
+extern "C" void BridgeEditorReassert() {
+  const size_t count = g_effect_count.load();
+  for (size_t index = 0; index < count; ++index) {
+    ClaimedEffect &effect = g_effects[index];
 
-        // An effect that Resolve has deleted keeps no window. Its vtable pointer is no longer
-        // ours, so the object behind that editor is gone, and a window left on screen is both a
-        // confusing artefact and a pointer waiting to be used. Reported by the tester on
-        // 2026-08-29: deleting a plugin from a clip or a track leaves its GUI open from time to
-        // time. This runs on the pump thread, which owns our windows, and closes only ours.
-        if (effect.editor_shown.load() && !EffectIsLive(effect)) {
-            BridgeEditorHideFor(&effect, "the effect is gone from the project");
-            continue;
-        }
-        if (effect.editor_wanted.load() && !effect.editor_shown.load()) {
-            BridgeEditorShowFor(&effect, "the effect wants a window");
-        }
+    // An effect that Resolve has deleted keeps no window. Its vtable pointer is
+    // no longer ours, so the object behind that editor is gone, and a window
+    // left on screen is both a confusing artefact and a pointer waiting to be
+    // used. Reported by the tester on 2026-08-29: deleting a plugin from a clip
+    // or a track leaves its GUI open from time to time. This runs on the pump
+    // thread, which owns our windows, and closes only ours.
+    if ((effect.editor_shown.load() || effect.editor_wanted.load()) &&
+        !EffectIsLive(effect)) {
+      BridgeEditorHideFor(&effect, "the effect is gone from the project");
+      continue;
     }
+    if (effect.editor_wanted.load() && !effect.editor_shown.load()) {
+      BridgeEditorShowFor(&effect, "the effect wants a window");
+    }
+  }
 }
 
+// The vtable we hand out. Two entries below the function pointers carry
+// offset-to-top and the typeinfo pointer, so dynamic_cast on the interface
+// keeps working.
+void *g_vtable[2 + kSlotCount];
+const void *g_interface = nullptr;
+void *g_stock_handle = nullptr;
 
-// The vtable we hand out. Two entries below the function pointers carry offset-to-top and the
-// typeinfo pointer, so dynamic_cast on the interface keeps working.
-void* g_vtable[2 + kSlotCount];
-const void* g_interface = nullptr;
-void* g_stock_handle = nullptr;
-
-// Every member offset on the stock effect that this bridge reads or writes, read out of
-// libBMDAudioPlugins.so at load - src/member_layout.h. Filled before our vtable is installed, so
-// none of the code that uses it can run without it.
+// Every member offset on the stock effect that this bridge reads or writes,
+// read out of libBMDAudioPlugins.so at load - src/member_layout.h. Filled
+// before our vtable is installed, so none of the code that uses it can run
+// without it.
 MemberLayout g_layout;
 
-// Make the page holding `address` writable. The interface object may live in a mapping that RELRO
-// has already turned read-only; without this the vptr write would fault.
-bool MakeWritable(void* address)
-{
-    const long page_size = sysconf(_SC_PAGESIZE);
-    auto page = reinterpret_cast<uintptr_t>(address) & ~static_cast<uintptr_t>(page_size - 1);
-    if (mprotect(reinterpret_cast<void*>(page), page_size, PROT_READ | PROT_WRITE) != 0) {
-        Log("mprotect on %p failed", address);
-        return false;
-    }
-    return true;
+// Make the page holding `address` writable. The interface object may live in a
+// mapping that RELRO has already turned read-only; without this the vptr write
+// would fault.
+bool MakeWritable(void *address) {
+  const long page_size = sysconf(_SC_PAGESIZE);
+  auto page = reinterpret_cast<uintptr_t>(address) &
+              ~static_cast<uintptr_t>(page_size - 1);
+  if (mprotect(reinterpret_cast<void *>(page), page_size,
+               PROT_READ | PROT_WRITE) != 0) {
+    Log("mprotect on %p failed", address);
+    return false;
+  }
+  return true;
 }
 
-void* LoadStockInterface()
-{
-    void* const handle = dlopen(kStockLibrary, RTLD_NOW | RTLD_LOCAL);
-    g_stock_handle = handle;
-    if (handle == nullptr) {
-        Log("dlopen(%s) failed: %s", kStockLibrary, dlerror());
-        return nullptr;
-    }
+void *LoadStockInterface() {
+  void *const handle = dlopen(kStockLibrary, RTLD_NOW | RTLD_LOCAL);
+  g_stock_handle = handle;
+  if (handle == nullptr) {
+    Log("dlopen(%s) failed: %s", kStockLibrary, dlerror());
+    return nullptr;
+  }
 
-    auto* const entry = reinterpret_cast<EntryPointFn>(dlsym(handle, kEntryPoint));
-    if (entry == nullptr) {
-        Log("dlsym(%s) failed: %s", kEntryPoint, dlerror());
-        return nullptr;
-    }
+  auto *const entry =
+      reinterpret_cast<EntryPointFn>(dlsym(handle, kEntryPoint));
+  if (entry == nullptr) {
+    Log("dlsym(%s) failed: %s", kEntryPoint, dlerror());
+    return nullptr;
+  }
 
-    void* const interface_ptr = entry();
-    if (interface_ptr == nullptr) {
-        Log("%s returned null", kEntryPoint);
-    }
-    return interface_ptr;
+  void *const interface_ptr = entry();
+  if (interface_ptr == nullptr) {
+    Log("%s returned null", kEntryPoint);
+  }
+  return interface_ptr;
 }
 
-}  // namespace
+} // namespace
 
-// Trampoline state and call counters. Hidden visibility keeps the assembly references
-// RIP-relative instead of going through the GOT.
+// Trampoline state and call counters. Hidden visibility keeps the assembly
+// references RIP-relative instead of going through the GOT.
 #define BRIDGE_HIDDEN __attribute__((visibility("hidden")))
 
 extern "C" {
-BRIDGE_HIDDEN void* g_original_query_plugin_list = nullptr;
-BRIDGE_HIDDEN void* g_original_create_plugin_instance = nullptr;
+BRIDGE_HIDDEN void *g_original_query_plugin_list = nullptr;
+BRIDGE_HIDDEN void *g_original_create_plugin_instance = nullptr;
 
-BRIDGE_HIDDEN void BridgeInspectQueryEntry(const void* arg0, unsigned long arg1, unsigned long arg2);
-BRIDGE_HIDDEN void BridgeInspectQueryExit(void* result);
-BRIDGE_HIDDEN void* BridgeInspectCreateEntry(const void* self, unsigned long category, const void* key);
-BRIDGE_HIDDEN void BridgeInspectCreateExit(void* result);
+BRIDGE_HIDDEN void BridgeInspectQueryEntry(const void *arg0, unsigned long arg1,
+                                           unsigned long arg2);
+BRIDGE_HIDDEN void BridgeInspectQueryExit(void *result);
+BRIDGE_HIDDEN void *BridgeInspectCreateEntry(const void *self,
+                                             unsigned long category,
+                                             const void *key);
+BRIDGE_HIDDEN void BridgeInspectCreateExit(void *result);
 
 BRIDGE_HIDDEN void BridgeThunkQueryPluginList();
 BRIDGE_HIDDEN void BridgeThunkCreatePluginInstance();
@@ -650,427 +674,459 @@ BRIDGE_HIDDEN void BridgeThunkCreatePluginInstance();
 namespace {
 constexpr int kMaxLoggedCalls = 20;
 int g_query_calls = 0;
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Safe introspection.
 //
-// process_vm_readv against our own pid copies memory and reports EFAULT for an unmapped page,
-// where a plain dereference would fault. Every read of a pointer we have not proven goes through
-// this, so a wrong guess costs a log line instead of the application.
+// process_vm_readv against our own pid copies memory and reports EFAULT for an
+// unmapped page, where a plain dereference would fault. Every read of a pointer
+// we have not proven goes through this, so a wrong guess costs a log line
+// instead of the application.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-bool SafeRead(const void* address, void* out, size_t length)
-{
-    if (address == nullptr) {
-        return false;
-    }
-    iovec local{out, length};
-    iovec remote{const_cast<void*>(address), length};
-    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(length);
+bool SafeRead(const void *address, void *out, size_t length) {
+  if (address == nullptr) {
+    return false;
+  }
+  iovec local{out, length};
+  iovec remote{const_cast<void *>(address), length};
+  return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) ==
+         static_cast<ssize_t>(length);
 }
 
 // Writability, tested without faulting.
 //
-// SafeRead proves a buffer can be read. It does not prove it can be written, and that distinction
-// is what caused every audio fault in this bridge: Resolve does not always hand over as many
-// writable output channels as the hosted plugin wants, and a stale pointer can be perfectly
-// readable while its page is not writable. Measured 2026-08-25: output[0]=0x7f3ee5583f2c and
-// output[1]=0x7f3f963b5560, a gigabyte apart, and the memcpy into the second one killed the
-// process.
+// SafeRead proves a buffer can be read. It does not prove it can be written,
+// and that distinction is what caused every audio fault in this bridge: Resolve
+// does not always hand over as many writable output channels as the hosted
+// plugin wants, and a stale pointer can be perfectly readable while its page is
+// not writable. Measured 2026-08-25: output[0]=0x7f3ee5583f2c and
+// output[1]=0x7f3f963b5560, a gigabyte apart, and the memcpy into the second
+// one killed the process.
 //
-// process_vm_writev reports the failure instead of raising it, so the sample is written back to
-// itself and a rejection simply means "do not touch this channel".
-bool SafeWriteProbe(void* address)
-{
-    if (address == nullptr) {
-        return false;
-    }
-    float sample = 0.0f;
-    if (!SafeRead(address, &sample, sizeof(sample))) {
-        return false;
-    }
-    iovec local{&sample, sizeof(sample)};
-    iovec remote{address, sizeof(sample)};
-    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) ==
-           static_cast<ssize_t>(sizeof(sample));
+// process_vm_writev reports the failure instead of raising it, so the sample is
+// written back to itself and a rejection simply means "do not touch this
+// channel".
+bool SafeWriteProbe(void *address) {
+  if (address == nullptr) {
+    return false;
+  }
+  float sample = 0.0f;
+  if (!SafeRead(address, &sample, sizeof(sample))) {
+    return false;
+  }
+  iovec local{&sample, sizeof(sample)};
+  iovec remote{address, sizeof(sample)};
+  return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) ==
+         static_cast<ssize_t>(sizeof(sample));
 }
 
-bool LooksLikePointer(unsigned long value)
-{
-    return value > 0x10000 && value < 0x800000000000UL && (value & 7) == 0;
+bool LooksLikePointer(unsigned long value) {
+  return value > 0x10000 && value < 0x800000000000UL && (value & 7) == 0;
 }
 
-// Qt5 QString holds a QArrayData* whose header is {int ref; int size; uint alloc; qptrdiff offset}
-// and whose UTF-16 payload starts at header + offset. Read it back as Latin-1 for the log.
-bool ReadQStringData(const void* data_pointer, char* out, size_t out_size)
-{
-    struct Header {
-        int ref;
-        int size;
-        unsigned int alloc;
-        long offset;
-    } header;
+// Qt5 QString holds a QArrayData* whose header is {int ref; int size; uint
+// alloc; qptrdiff offset} and whose UTF-16 payload starts at header + offset.
+// Read it back as Latin-1 for the log.
+bool ReadQStringData(const void *data_pointer, char *out, size_t out_size) {
+  struct Header {
+    int ref;
+    int size;
+    unsigned int alloc;
+    long offset;
+  } header;
 
-    if (!SafeRead(data_pointer, &header, sizeof(header))) {
-        return false;
-    }
-    if (header.size <= 0 || header.size > 128 || header.offset < 0 || header.offset > 4096) {
-        return false;
-    }
+  if (!SafeRead(data_pointer, &header, sizeof(header))) {
+    return false;
+  }
+  if (header.size <= 0 || header.size > 128 || header.offset < 0 ||
+      header.offset > 4096) {
+    return false;
+  }
 
-    unsigned short utf16[128];
-    const auto* payload = static_cast<const unsigned char*>(data_pointer) + header.offset;
-    const size_t count = static_cast<size_t>(header.size);
-    if (!SafeRead(payload, utf16, count * sizeof(unsigned short))) {
-        return false;
-    }
+  unsigned short utf16[128];
+  const auto *payload =
+      static_cast<const unsigned char *>(data_pointer) + header.offset;
+  const size_t count = static_cast<size_t>(header.size);
+  if (!SafeRead(payload, utf16, count * sizeof(unsigned short))) {
+    return false;
+  }
 
-    size_t written = 0;
-    for (size_t i = 0; i < count && written + 1 < out_size; ++i) {
-        out[written++] = (utf16[i] >= 0x20 && utf16[i] < 0x7f) ? static_cast<char>(utf16[i]) : '.';
-    }
-    out[written] = '\0';
-    return written > 0;
+  size_t written = 0;
+  for (size_t i = 0; i < count && written + 1 < out_size; ++i) {
+    out[written++] = (utf16[i] >= 0x20 && utf16[i] < 0x7f)
+                         ? static_cast<char>(utf16[i])
+                         : '.';
+  }
+  out[written] = '\0';
+  return written > 0;
 }
 
-// Dump one machine word per line: raw value, and whatever it turns out to point at.
-void DumpWords(const char* label, const void* address, int count)
-{
-    unsigned long words[16];
-    if (count > 16) {
-        count = 16;
-    }
-    if (!SafeRead(address, words, static_cast<size_t>(count) * sizeof(unsigned long))) {
-        Log("  %s @%p unreadable", label, address);
-        return;
+// Dump one machine word per line: raw value, and whatever it turns out to point
+// at.
+void DumpWords(const char *label, const void *address, int count) {
+  unsigned long words[16];
+  if (count > 16) {
+    count = 16;
+  }
+  if (!SafeRead(address, words,
+                static_cast<size_t>(count) * sizeof(unsigned long))) {
+    Log("  %s @%p unreadable", label, address);
+    return;
+  }
+
+  for (int i = 0; i < count; ++i) {
+    char text[160];
+    if (ReadQStringData(reinterpret_cast<const void *>(words[i]), text,
+                        sizeof(text))) {
+      Log("  %s[%d] = 0x%016lx  QString \"%s\"", label, i, words[i], text);
+      continue;
     }
 
-    for (int i = 0; i < count; ++i) {
-        char text[160];
-        if (ReadQStringData(reinterpret_cast<const void*>(words[i]), text, sizeof(text))) {
-            Log("  %s[%d] = 0x%016lx  QString \"%s\"", label, i, words[i], text);
-            continue;
-        }
-
-        unsigned long inner = 0;
-        if (LooksLikePointer(words[i]) &&
-            SafeRead(reinterpret_cast<const void*>(words[i]), &inner, sizeof(inner))) {
-            char inner_text[160];
-            if (ReadQStringData(reinterpret_cast<const void*>(inner), inner_text, sizeof(inner_text))) {
-                Log("  %s[%d] = 0x%016lx -> 0x%016lx  QString \"%s\"",
-                    label, i, words[i], inner, inner_text);
-            } else {
-                Log("  %s[%d] = 0x%016lx -> 0x%016lx", label, i, words[i], inner);
-            }
-            continue;
-        }
-        Log("  %s[%d] = 0x%016lx", label, i, words[i]);
+    unsigned long inner = 0;
+    if (LooksLikePointer(words[i]) &&
+        SafeRead(reinterpret_cast<const void *>(words[i]), &inner,
+                 sizeof(inner))) {
+      char inner_text[160];
+      if (ReadQStringData(reinterpret_cast<const void *>(inner), inner_text,
+                          sizeof(inner_text))) {
+        Log("  %s[%d] = 0x%016lx -> 0x%016lx  QString \"%s\"", label, i,
+            words[i], inner, inner_text);
+      } else {
+        Log("  %s[%d] = 0x%016lx -> 0x%016lx", label, i, words[i], inner);
+      }
+      continue;
     }
+    Log("  %s[%d] = 0x%016lx", label, i, words[i]);
+  }
 }
 
-}  // namespace
-
+} // namespace
 
 // libc++ std::map<QString, AudioPluginDefinition> returned by value.
 //
 // The container is three words: {__begin_node_, root, size}. A node is
-// {__left_, __right_, __parent_, __is_black_ (padded)} followed by the value pair at +32, so the
-// QString key sits at +32 and the AudioPluginDefinition begins at +40. Nothing here is guessed
-// past that: every read is checked, and the keys must come back as the effect names in the menu.
+// {__left_, __right_, __parent_, __is_black_ (padded)} followed by the value
+// pair at +32, so the QString key sits at +32 and the AudioPluginDefinition
+// begins at +40. Nothing here is guessed past that: every read is checked, and
+// the keys must come back as the effect names in the menu.
 namespace {
 
 extern const char kSourcePluginKey[];
-extern const void* g_source_node;
+extern const void *g_source_node;
 
 constexpr int kNodeLeft = 0;
 constexpr int kNodeRight = 1;
-constexpr int kNodeKey = 4;    // +32 bytes
-constexpr int kNodeValue = 5;  // +40 bytes
+constexpr int kNodeKey = 4;   // +32 bytes
+constexpr int kNodeValue = 5; // +40 bytes
 
-unsigned long NodeWord(const void* node, int index)
-{
-    unsigned long value = 0;
-    if (!SafeRead(static_cast<const unsigned char*>(node) + index * 8, &value, sizeof(value))) {
-        return 0;
-    }
-    return value;
+unsigned long NodeWord(const void *node, int index) {
+  unsigned long value = 0;
+  if (!SafeRead(static_cast<const unsigned char *>(node) + index * 8, &value,
+                sizeof(value))) {
+    return 0;
+  }
+  return value;
 }
 
-void WalkPluginMap(const void* container, bool quiet)
-{
-    g_source_node = nullptr;
+void WalkPluginMap(const void *container, bool quiet) {
+  g_source_node = nullptr;
 
-    unsigned long header[3];
-    if (!SafeRead(container, header, sizeof(header))) {
-        if (!quiet) { Log("  plugin map @%p unreadable", container); }
-        return;
+  unsigned long header[3];
+  if (!SafeRead(container, header, sizeof(header))) {
+    if (!quiet) {
+      Log("  plugin map @%p unreadable", container);
     }
-    if (!quiet) { Log("  map: begin=0x%lx root=0x%lx size=%lu", header[0], header[1], header[2]); }
+    return;
+  }
+  if (!quiet) {
+    Log("  map: begin=0x%lx root=0x%lx size=%lu", header[0], header[1],
+        header[2]);
+  }
 
-    // In-order walk without a parent chain: an explicit stack is simpler to verify than __tree_next.
-    const void* stack[64];
-    int depth = 0;
-    const void* node = reinterpret_cast<const void*>(header[1]);
-    int listed = 0;
+  // In-order walk without a parent chain: an explicit stack is simpler to
+  // verify than __tree_next.
+  const void *stack[64];
+  int depth = 0;
+  const void *node = reinterpret_cast<const void *>(header[1]);
+  int listed = 0;
 
-    while ((node != nullptr || depth > 0) && listed < 64) {
-        while (node != nullptr && depth < 64) {
-            stack[depth++] = node;
-            node = reinterpret_cast<const void*>(NodeWord(node, kNodeLeft));
-        }
-        if (depth == 0) {
-            break;
-        }
-        node = stack[--depth];
+  while ((node != nullptr || depth > 0) && listed < 64) {
+    while (node != nullptr && depth < 64) {
+      stack[depth++] = node;
+      node = reinterpret_cast<const void *>(NodeWord(node, kNodeLeft));
+    }
+    if (depth == 0) {
+      break;
+    }
+    node = stack[--depth];
 
-        char name[160];
-        const auto key = reinterpret_cast<const void*>(NodeWord(node, kNodeKey));
-        if (!ReadQStringData(key, name, sizeof(name))) {
-            std::snprintf(name, sizeof(name), "<key 0x%lx unreadable>", reinterpret_cast<unsigned long>(key));
-        }
+    char name[160];
+    const auto key = reinterpret_cast<const void *>(NodeWord(node, kNodeKey));
+    if (!ReadQStringData(key, name, sizeof(name))) {
+      std::snprintf(name, sizeof(name), "<key 0x%lx unreadable>",
+                    reinterpret_cast<unsigned long>(key));
+    }
 
-        if (std::strcmp(name, kSourcePluginKey) == 0) {
-            g_source_node = node;
-        }
+    if (std::strcmp(name, kSourcePluginKey) == 0) {
+      g_source_node = node;
+    }
 
-        if (quiet) {
-            // nothing to report
-        } else if (listed < 6) {
-            Log("  [%02d] \"%s\"", listed, name);
-            for (int word = 0; word < 8; ++word) {
-                char text[160];
-                const unsigned long raw = NodeWord(node, kNodeValue + word);
-                if (ReadQStringData(reinterpret_cast<const void*>(raw), text, sizeof(text))) {
-                    Log("        def+%02d = 0x%016lx  QString \"%s\"", word * 8, raw, text);
-                } else {
-                    Log("        def+%02d = 0x%016lx", word * 8, raw);
-                }
-            }
+    if (quiet) {
+      // nothing to report
+    } else if (listed < 6) {
+      Log("  [%02d] \"%s\"", listed, name);
+      for (int word = 0; word < 8; ++word) {
+        char text[160];
+        const unsigned long raw = NodeWord(node, kNodeValue + word);
+        if (ReadQStringData(reinterpret_cast<const void *>(raw), text,
+                            sizeof(text))) {
+          Log("        def+%02d = 0x%016lx  QString \"%s\"", word * 8, raw,
+              text);
         } else {
-            Log("  [%02d] \"%s\"", listed, name);
+          Log("        def+%02d = 0x%016lx", word * 8, raw);
         }
-        ++listed;
-
-        node = reinterpret_cast<const void*>(NodeWord(node, kNodeRight));
+      }
+    } else {
+      Log("  [%02d] \"%s\"", listed, name);
     }
-    if (!quiet) { Log("  walked %d entries", listed); }
+    ++listed;
+
+    node = reinterpret_cast<const void *>(NodeWord(node, kNodeRight));
+  }
+  if (!quiet) {
+    Log("  walked %d entries", listed);
+  }
 }
 
-}  // namespace
-
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Adding an entry of our own.
 //
-// The stock library exports the map's own insert helper, so we do not have to reproduce libc++
-// node allocation or red-black rebalancing:
+// The stock library exports the map's own insert helper, so we do not have to
+// reproduce libc++ node allocation or red-black rebalancing:
 //
-//   std::__tree<__value_type<QString, BMDAudioPluginFactory::PluginDefinition>, …>
-//       ::__emplace_unique_key_args<QString, std::pair<QString const, PluginDefinition>>(
+//   std::__tree<__value_type<QString, BMDAudioPluginFactory::PluginDefinition>,
+//   …>
+//       ::__emplace_unique_key_args<QString, std::pair<QString const,
+//       PluginDefinition>>(
 //           QString const& key, pair&& value)
 //
-// The node is copy-constructed from the pair we pass, so every QString inside the definition is
-// deep-copied by Qt with correct reference counts. We build our own key and display name as
-// *static* QStringData (ref = -1, the marker Qt uses for QStringLiteral), which Qt never frees and
-// never refcounts — that removes the whole ownership question from this experiment.
+// The node is copy-constructed from the pair we pass, so every QString inside
+// the definition is deep-copied by Qt with correct reference counts. We build
+// our own key and display name as *static* QStringData (ref = -1, the marker Qt
+// uses for QStringLiteral), which Qt never frees and never refcounts — that
+// removes the whole ownership question from this experiment.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 const char kSourcePluginKey[] = "Delay:1112360057";
 
-// Measured, not guessed: __emplace_unique_key_args allocates the node with `mov $0x68,%edi` before
-// `operator new`, so a node is 104 bytes. Take off the 32-byte node header and the 8-byte QString
-// key and BMDAudioPluginFactory::PluginDefinition is 64 bytes. The interface version gate (100)
-// guards this number against a Resolve update.
+// Measured, not guessed: __emplace_unique_key_args allocates the node with `mov
+// $0x68,%edi` before `operator new`, so a node is 104 bytes. Take off the
+// 32-byte node header and the 8-byte QString key and
+// BMDAudioPluginFactory::PluginDefinition is 64 bytes. The interface version
+// gate (100) guards this number against a Resolve update.
 constexpr size_t kNodeBytes = 0x68;
 constexpr size_t kNodeHeaderBytes = 32;
-constexpr size_t kPairBytes = kNodeBytes - kNodeHeaderBytes;  // 72: key + definition
+constexpr size_t kPairBytes =
+    kNodeBytes - kNodeHeaderBytes; // 72: key + definition
 
 // Qt5 QArrayData followed by its UTF-16 payload.
 struct StaticQtString {
-    int reference_count;
-    int size;
-    unsigned int allocated_and_flags;
-    long offset;
-    unsigned short text[64];
+  int reference_count;
+  int size;
+  unsigned int allocated_and_flags;
+  long offset;
+  unsigned short text[64];
 };
 
-void InitStaticQtString(StaticQtString& target, const char* ascii)
-{
-    int length = 0;
-    while (ascii[length] != '\0' && length < 63) {
-        target.text[length] = static_cast<unsigned short>(ascii[length]);
-        ++length;
-    }
-    target.text[length] = 0;
-    target.reference_count = -1;  // static: Qt neither counts nor frees it
-    target.size = length;
-    target.allocated_and_flags = 0;
-    target.offset = offsetof(StaticQtString, text);
+void InitStaticQtString(StaticQtString &target, const char *ascii) {
+  int length = 0;
+  while (ascii[length] != '\0' && length < 63) {
+    target.text[length] = static_cast<unsigned short>(ascii[length]);
+    ++length;
+  }
+  target.text[length] = 0;
+  target.reference_count = -1; // static: Qt neither counts nor frees it
+  target.size = length;
+  target.allocated_and_flags = 0;
+  target.offset = offsetof(StaticQtString, text);
 }
 
 // One menu entry per plugin the scanner found.
 //
-// Each entry is a clone of the source effect's definition with two fields swapped: the key and the
-// display name. The rest of the 64-byte definition stays the source's, which is what makes the
-// entry instantiable at all - the stock factory builds the source effect, and the create hook then
-// claims the instance and gives it the plugin the key names.
+// Each entry is a clone of the source effect's definition with two fields
+// swapped: the key and the display name. The rest of the 64-byte definition
+// stays the source's, which is what makes the entry instantiable at all - the
+// stock factory builds the source effect, and the create hook then claims the
+// instance and gives it the plugin the key names.
 //
-// The clones are heap-allocated and never freed. Their addresses are handed to Qt as static
-// QStringData, so they have to outlive every effect; a vector would move them on the first growth
-// and leave Qt reading freed memory. The category stays Uncategorized - see the note further down.
+// The clones are heap-allocated and never freed. Their addresses are handed to
+// Qt as static QStringData, so they have to outlive every effect; a vector
+// would move them on the first growth and leave Qt reading freed memory. The
+// category stays Uncategorized - see the note further down.
 struct Clone {
-    std::string key;   // "<plugin name>:1112360057"
-    std::string name;  // what the menu reads
-    std::string path;  // the plugin file this entry loads
-    std::string class_name;  // which plugin inside that file, for a VST3 shell; empty otherwise
-    PluginFormat format;
-    StaticQtString key_string;
-    StaticQtString name_string;
-    void* key_slot;
+  std::string key;        // "<plugin name>:1112360057"
+  std::string name;       // what the menu reads
+  std::string path;       // the plugin file this entry loads
+  std::string class_name; // which plugin inside that file, for a VST3 shell;
+                          // empty otherwise
+  PluginFormat format;
+  StaticQtString key_string;
+  StaticQtString name_string;
+  void *key_slot;
 };
 
-std::vector<Clone*> g_clones;
-const void* g_source_node = nullptr;
+std::vector<Clone *> g_clones;
+const void *g_source_node = nullptr;
 
 // Builds one clone per scanned plugin, once. Returns them in menu order.
-const std::vector<Clone*>& Catalogue()
-{
-    static bool built = false;
-    if (built) {
-        return g_clones;
-    }
-    built = true;
-
-    for (const ScannedPlugin& scanned : ScannedPlugins()) {
-        auto* const clone = new Clone();
-        clone->key = scanned.key;
-        clone->name = scanned.name;
-        clone->path = scanned.path;
-        clone->class_name = scanned.class_name;
-        clone->format = scanned.format;
-        InitStaticQtString(clone->key_string, clone->key.c_str());
-        InitStaticQtString(clone->name_string, clone->name.c_str());
-        clone->key_slot = &clone->key_string;
-        g_clones.push_back(clone);
-    }
-    Log("menu: %zu entries to insert", g_clones.size());
+const std::vector<Clone *> &Catalogue() {
+  static bool built = false;
+  if (built) {
     return g_clones;
+  }
+  built = true;
+
+  for (const ScannedPlugin &scanned : ScannedPlugins()) {
+    auto *const clone = new Clone();
+    clone->key = scanned.key;
+    clone->name = scanned.name;
+    clone->path = scanned.path;
+    clone->class_name = scanned.class_name;
+    clone->format = scanned.format;
+    InitStaticQtString(clone->key_string, clone->key.c_str());
+    InitStaticQtString(clone->name_string, clone->name.c_str());
+    clone->key_slot = &clone->key_string;
+    g_clones.push_back(clone);
+  }
+  Log("menu: %zu entries to insert", g_clones.size());
+  return g_clones;
 }
 
-// Which clone a key names, or null. The create hook asks this on every CreatePluginInstance call,
-// so it is a linear scan over a list that is built once and never changed.
-const Clone* CloneForKey(const char* key)
-{
-    if (key == nullptr) {
-        return nullptr;
-    }
-    for (const Clone* clone : Catalogue()) {
-        if (clone->key == key) {
-            return clone;
-        }
-    }
+// Which clone a key names, or null. The create hook asks this on every
+// CreatePluginInstance call, so it is a linear scan over a list that is built
+// once and never changed.
+const Clone *CloneForKey(const char *key) {
+  if (key == nullptr) {
     return nullptr;
+  }
+  for (const Clone *clone : Catalogue()) {
+    if (clone->key == key) {
+      return clone;
+    }
+  }
+  return nullptr;
 }
 
-using EmplaceFn = void* (*)(void* tree, const void* key, void* value_pair);
+using EmplaceFn = void *(*)(void *tree, const void *key, void *value_pair);
 
 const char kEmplaceSymbol[] =
-    "_ZNSt3__16__treeINS_12__value_typeI7QStringN21BMDAudioPluginFactory16PluginDefinitionEEENS_19"
-    "__map_value_compareIS2_S5_NS_4lessIS2_EELb1EEENS_9allocatorIS5_EEE25__emplace_unique_key_args"
-    "IS2_JNS_4pairIKS2_S4_EEEEENSE_INS_15__tree_iteratorIS5_PNS_11__tree_nodeIS5_PvEElEEbEERKT_DpOT0_";
+    "_ZNSt3__16__treeINS_12__value_"
+    "typeI7QStringN21BMDAudioPluginFactory16PluginDefinitionEEENS_19"
+    "__map_value_compareIS2_S5_NS_4lessIS2_EELb1EEENS_9allocatorIS5_EEE25__"
+    "emplace_unique_key_args"
+    "IS2_JNS_4pairIKS2_S4_EEEEENSE_INS_15__tree_iteratorIS5_PNS_11__tree_"
+    "nodeIS5_PvEElEEbEERKT_DpOT0_";
 
-void InsertOurEntry(void* container)
-{
-    if (g_source_node == nullptr || g_stock_handle == nullptr) {
-        return;
+void InsertOurEntry(void *container) {
+  if (g_source_node == nullptr || g_stock_handle == nullptr) {
+    return;
+  }
+
+  static auto *const emplace =
+      reinterpret_cast<EmplaceFn>(dlsym(g_stock_handle, kEmplaceSymbol));
+  if (emplace == nullptr) {
+    Log("  insert skipped: __emplace_unique_key_args not found");
+    return;
+  }
+
+  unsigned char value_pair[kPairBytes];
+  const auto *source_pair =
+      static_cast<const unsigned char *>(g_source_node) + kNodeHeaderBytes;
+
+  int inserted = 0;
+  for (Clone *clone : Catalogue()) {
+    // The source pair is re-read per clone: emplace copy-constructs from what
+    // we pass, and reading once and reusing the buffer would hand every clone
+    // the same QString refcount.
+    if (!SafeRead(source_pair, value_pair, sizeof(value_pair))) {
+      Log("  insert skipped: source entry unreadable");
+      return;
     }
 
-    static auto* const emplace = reinterpret_cast<EmplaceFn>(dlsym(g_stock_handle, kEmplaceSymbol));
-    if (emplace == nullptr) {
-        Log("  insert skipped: __emplace_unique_key_args not found");
-        return;
-    }
+    // Swap in this clone's key and display name. The other 56 bytes stay the
+    // source's.
+    void *name_data = &clone->name_string;
+    std::memcpy(value_pair + 0, &clone->key_slot,
+                sizeof(void *));                             // pair.first = key
+    std::memcpy(value_pair + 8, &name_data, sizeof(void *)); // definition.name
 
-    unsigned char value_pair[kPairBytes];
-    const auto* source_pair = static_cast<const unsigned char*>(g_source_node) + kNodeHeaderBytes;
-
-    int inserted = 0;
-    for (Clone* clone : Catalogue()) {
-        // The source pair is re-read per clone: emplace copy-constructs from what we pass, and
-        // reading once and reusing the buffer would hand every clone the same QString refcount.
-        if (!SafeRead(source_pair, value_pair, sizeof(value_pair))) {
-            Log("  insert skipped: source entry unreadable");
-            return;
-        }
-
-        // Swap in this clone's key and display name. The other 56 bytes stay the source's.
-        void* name_data = &clone->name_string;
-        std::memcpy(value_pair + 0, &clone->key_slot, sizeof(void*));  // pair.first = key
-        std::memcpy(value_pair + 8, &name_data, sizeof(void*));        // definition.name
-
-        emplace(container, &clone->key_slot, value_pair);
-        ++inserted;
-    }
-    if (g_query_calls <= kMaxLoggedCalls) {
-        Log("  inserted %d entries", inserted);
-    }
+    emplace(container, &clone->key_slot, value_pair);
+    ++inserted;
+  }
+  if (g_query_calls <= kMaxLoggedCalls) {
+    Log("  inserted %d entries", inserted);
+  }
 }
 
-}  // namespace
+} // namespace
 
-extern "C" void BridgeInspectQueryEntry(const void* arg0, unsigned long arg1, unsigned long arg2)
-{
-    if (++g_query_calls > kMaxLoggedCalls) {
-        return;
-    }
-    // If arg0 is the interface, the result is a scalar in rax and arg1 is the category.
-    // If it is not, arg0 is a hidden sret pointer and the interface has moved to arg1.
-    Log("QueryPluginList #%d entry: arg0=%p arg1=0x%lx arg2=0x%lx  interface=%p  (%s)",
-        g_query_calls, arg0, arg1, arg2, g_interface,
-        arg0 == g_interface ? "arg0 is this: value returned in rax"
-                            : "arg0 is an sret pointer: this is arg1");
+extern "C" void BridgeInspectQueryEntry(const void *arg0, unsigned long arg1,
+                                        unsigned long arg2) {
+  if (++g_query_calls > kMaxLoggedCalls) {
+    return;
+  }
+  // If arg0 is the interface, the result is a scalar in rax and arg1 is the
+  // category. If it is not, arg0 is a hidden sret pointer and the interface has
+  // moved to arg1.
+  Log("QueryPluginList #%d entry: arg0=%p arg1=0x%lx arg2=0x%lx  interface=%p  "
+      "(%s)",
+      g_query_calls, arg0, arg1, arg2, g_interface,
+      arg0 == g_interface ? "arg0 is this: value returned in rax"
+                          : "arg0 is an sret pointer: this is arg1");
 }
 
-extern "C" void BridgeInspectQueryExit(void* result)
-{
-    const bool quiet = g_query_calls > kMaxLoggedCalls;
-    if (!quiet) {
-        Log("QueryPluginList #%d exit: rax=%p", g_query_calls, result);
-        DumpWords("rax", result, 3);
-    }
-    WalkPluginMap(result, quiet);
-    InsertOurEntry(result);
+extern "C" void BridgeInspectQueryExit(void *result) {
+  const bool quiet = g_query_calls > kMaxLoggedCalls;
+  if (!quiet) {
+    Log("QueryPluginList #%d exit: rax=%p", g_query_calls, result);
+    DumpWords("rax", result, 3);
+  }
+  WalkPluginMap(result, quiet);
+  InsertOurEntry(result);
 }
 
-// Save every argument register, report the call, restore, then tail-jump to the stock function.
-// The extra 8 bytes keep the stack 16-byte aligned across the call.
-#define BRIDGE_TRAMPOLINE(name, note, target)   \
-    ".text\n"                                   \
-    ".globl " name "\n"                         \
-    ".hidden " name "\n"                        \
-    ".type " name ", @function\n"               \
-    name ":\n"                                  \
-    "  pushq %rdi\n"                            \
-    "  pushq %rsi\n"                            \
-    "  pushq %rdx\n"                            \
-    "  pushq %rcx\n"                            \
-    "  pushq %r8\n"                             \
-    "  pushq %r9\n"                             \
-    "  subq $8, %rsp\n"                         \
-    "  call " note "\n"                         \
-    "  addq $8, %rsp\n"                         \
-    "  popq %r9\n"                              \
-    "  popq %r8\n"                              \
-    "  popq %rcx\n"                             \
-    "  popq %rdx\n"                             \
-    "  popq %rsi\n"                             \
-    "  popq %rdi\n"                             \
-    "  jmp *" target "(%rip)\n"
+// Save every argument register, report the call, restore, then tail-jump to the
+// stock function. The extra 8 bytes keep the stack 16-byte aligned across the
+// call.
+#define BRIDGE_TRAMPOLINE(name, note, target)                                  \
+  ".text\n"                                                                    \
+  ".globl " name "\n"                                                          \
+  ".hidden " name "\n"                                                         \
+  ".type " name ", @function\n" name ":\n"                                     \
+  "  pushq %rdi\n"                                                             \
+  "  pushq %rsi\n"                                                             \
+  "  pushq %rdx\n"                                                             \
+  "  pushq %rcx\n"                                                             \
+  "  pushq %r8\n"                                                              \
+  "  pushq %r9\n"                                                              \
+  "  subq $8, %rsp\n"                                                          \
+  "  call " note "\n"                                                          \
+  "  addq $8, %rsp\n"                                                          \
+  "  popq %r9\n"                                                               \
+  "  popq %r8\n"                                                               \
+  "  popq %rcx\n"                                                              \
+  "  popq %rdx\n"                                                              \
+  "  popq %rsi\n"                                                              \
+  "  popq %rdi\n"                                                              \
+  "  jmp *" target "(%rip)\n"
 
 asm(".text\n"
     ".globl BridgeThunkQueryPluginList\n"
@@ -1085,7 +1141,7 @@ asm(".text\n"
     "  pushq %rcx\n"
     "  pushq %r8\n"
     "  pushq %r9\n"
-    "  call BridgeInspectQueryEntry\n"   // arg registers are already in place
+    "  call BridgeInspectQueryEntry\n" // arg registers are already in place
     "  popq %r9\n"
     "  popq %r8\n"
     "  popq %rcx\n"
@@ -1097,7 +1153,8 @@ asm(".text\n"
     "  movq %rax, (%rsp)\n"
     "  movq %rax, %rdi\n"
     "  call BridgeInspectQueryExit\n"
-    "  movq (%rsp), %rax\n"             // rax also carries the sret address on a memory return
+    "  movq (%rsp), %rax\n" // rax also carries the sret address on a memory
+                            // return
     "  addq $16, %rsp\n"
     "  movq %rbp, %rsp\n"
     "  popq %rbp\n"
@@ -1116,8 +1173,8 @@ asm(".text\n"
     "  pushq %rcx\n"
     "  pushq %r8\n"
     "  pushq %r9\n"
-    "  call BridgeInspectCreateEntry\n"    // arg registers are already in place
-    "  movq %rax, %r10\n"                  // a replacement QString argument, or null
+    "  call BridgeInspectCreateEntry\n" // arg registers are already in place
+    "  movq %rax, %r10\n" // a replacement QString argument, or null
     "  popq %r9\n"
     "  popq %r8\n"
     "  popq %rcx\n"
@@ -1139,384 +1196,411 @@ asm(".text\n"
     "  popq %rbp\n"
     "  ret\n");
 
-
-
 // ---------------------------------------------------------------------------
 // Wrapping the instance.
 //
-// bmd::PluginInstance is abstract, and the concrete BMDAudioPluginImpl is a QObject: slots 0-11 are
-// QObject's own, the plugin API starts at slot 12, and the audio callbacks sit at the end:
+// bmd::PluginInstance is abstract, and the concrete BMDAudioPluginImpl is a
+// QObject: slots 0-11 are QObject's own, the plugin API starts at slot 12, and
+// the audio callbacks sit at the end:
 //
 //   66: PreProcess(float**, long, unsigned long)
 //   67: PostProcess(float**, float**, unsigned long)
 //
-// So we do not build an instance. We let the stock factory build a real one and repoint it at a
-// copy of its own vtable, with those two slots replaced. Every QObject mechanism, the parameter
-// panel and the automation stay genuine, and only the audio path becomes ours.
+// So we do not build an instance. We let the stock factory build a real one and
+// repoint it at a copy of its own vtable, with those two slots replaced. Every
+// QObject mechanism, the parameter panel and the automation stay genuine, and
+// only the audio path becomes ours.
 //
-// This step only observes. It calls the stock callback, then reports the buffers and the frame
-// count. Writing samples comes after we have seen what the arguments really are.
+// This step only observes. It calls the stock callback, then reports the
+// buffers and the frame count. Writing samples comes after we have seen what
+// the arguments really are.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-constexpr int kInstanceSlotCount = 80;   // past slot 67; spare slots are copied, never called
+constexpr int kInstanceSlotCount =
+    80; // past slot 67; spare slots are copied, never called
 constexpr int kSlotGetAudioPluginInterface = 12;
 constexpr int kSlotPreProcess = 66;
 constexpr int kSlotPostProcess = 67;
 
-void* g_instance_vtable[2 + kInstanceSlotCount];
-void* g_stock_instance_vtable = nullptr;
+void *g_instance_vtable[2 + kInstanceSlotCount];
+void *g_stock_instance_vtable = nullptr;
 bool g_instance_vtable_built = false;
 int g_instances_wrapped = 0;
-// The clone CreatePluginInstance was called for, or null. Set in the entry hook and read in
-// the exit hook - one call on one thread, the same window the bool had.
+// The clone CreatePluginInstance was called for, or null. Set in the entry hook
+// and read in the exit hook - one call on one thread, the same window the bool
+// had.
 struct Clone;
-thread_local const Clone* g_creating_clone = nullptr;
+thread_local const Clone *g_creating_clone = nullptr;
 int g_pre_process_calls = 0;
 int g_post_process_calls = 0;
 
-}  // namespace
+} // namespace
 
 #define BRIDGE_HIDDEN2 __attribute__((visibility("hidden")))
 
 extern "C" {
-BRIDGE_HIDDEN2 void* g_original_get_audio_interface = nullptr;
-BRIDGE_HIDDEN2 void* g_original_pre_process = nullptr;
-BRIDGE_HIDDEN2 void* g_original_post_process = nullptr;
-BRIDGE_HIDDEN2 void BridgeAfterPreProcess(void* self, float** buffers, long a, unsigned long frames);
-BRIDGE_HIDDEN2 void BridgeAfterPostProcess(void* self, float** input, float** output, unsigned long frames);
-BRIDGE_HIDDEN2 void BridgeAfterGetAudioInterface(void* self);
+BRIDGE_HIDDEN2 void *g_original_get_audio_interface = nullptr;
+BRIDGE_HIDDEN2 void *g_original_pre_process = nullptr;
+BRIDGE_HIDDEN2 void *g_original_post_process = nullptr;
+BRIDGE_HIDDEN2 void BridgeAfterPreProcess(void *self, float **buffers, long a,
+                                          unsigned long frames);
+BRIDGE_HIDDEN2 void BridgeAfterPostProcess(void *self, float **input,
+                                           float **output,
+                                           unsigned long frames);
+BRIDGE_HIDDEN2 void BridgeAfterGetAudioInterface(void *self);
 BRIDGE_HIDDEN2 void BridgeThunkGetAudioInterface();
 BRIDGE_HIDDEN2 void BridgeThunkPreProcess();
 BRIDGE_HIDDEN2 void BridgeThunkPostProcess();
 }
 
-extern "C" void BridgeAfterGetAudioInterface(void* returned)
-{
-    static int calls = 0;
-    if (++calls > 3 || returned == nullptr) {
-        return;
-    }
-    unsigned long vptr = 0;
-    SafeRead(returned, &vptr, sizeof(vptr));
-    Log("GetAudioPluginInterface #%d returned %p, its vtable is 0x%lx", calls, returned, vptr);
+extern "C" void BridgeAfterGetAudioInterface(void *returned) {
+  static int calls = 0;
+  if (++calls > 3 || returned == nullptr) {
+    return;
+  }
+  unsigned long vptr = 0;
+  SafeRead(returned, &vptr, sizeof(vptr));
+  Log("GetAudioPluginInterface #%d returned %p, its vtable is 0x%lx", calls,
+      returned, vptr);
 }
 
-extern "C" void BridgeAfterPreProcess(void* self, float** buffers, long a, unsigned long frames)
-{
-    (void)self;
-    if (++g_pre_process_calls <= 3) {
-        Log("PreProcess #%d: buffers=%p arg=%ld frames=%lu", g_pre_process_calls, buffers, a, frames);
-    }
+extern "C" void BridgeAfterPreProcess(void *self, float **buffers, long a,
+                                      unsigned long frames) {
+  (void)self;
+  if (++g_pre_process_calls <= 3) {
+    Log("PreProcess #%d: buffers=%p arg=%ld frames=%lu", g_pre_process_calls,
+        buffers, a, frames);
+  }
 }
 
-extern "C" void BridgeAfterPostProcess(void* self, float** input, float** output, unsigned long frames)
-{
-    (void)self;
-    if (++g_post_process_calls > 3) {
-        return;
-    }
+extern "C" void BridgeAfterPostProcess(void *self, float **input,
+                                       float **output, unsigned long frames) {
+  (void)self;
+  if (++g_post_process_calls > 3) {
+    return;
+  }
 
-    // Read one sample through the checked reader before trusting either buffer.
-    float first_in = 0.0f;
-    float first_out = 0.0f;
-    unsigned long input_channel = 0;
-    unsigned long output_channel = 0;
-    SafeRead(input, &input_channel, sizeof(input_channel));
-    SafeRead(output, &output_channel, sizeof(output_channel));
-    SafeRead(reinterpret_cast<const void*>(input_channel), &first_in, sizeof(first_in));
-    SafeRead(reinterpret_cast<const void*>(output_channel), &first_out, sizeof(first_out));
+  // Read one sample through the checked reader before trusting either buffer.
+  float first_in = 0.0f;
+  float first_out = 0.0f;
+  unsigned long input_channel = 0;
+  unsigned long output_channel = 0;
+  SafeRead(input, &input_channel, sizeof(input_channel));
+  SafeRead(output, &output_channel, sizeof(output_channel));
+  SafeRead(reinterpret_cast<const void *>(input_channel), &first_in,
+           sizeof(first_in));
+  SafeRead(reinterpret_cast<const void *>(output_channel), &first_out,
+           sizeof(first_out));
 
-    Log("PostProcess #%d: frames=%lu in[0]=%p out[0]=%p first in=%.6f out=%.6f",
-        g_post_process_calls, frames,
-        reinterpret_cast<void*>(input_channel), reinterpret_cast<void*>(output_channel),
-        static_cast<double>(first_in), static_cast<double>(first_out));
+  Log("PostProcess #%d: frames=%lu in[0]=%p out[0]=%p first in=%.6f out=%.6f",
+      g_post_process_calls, frames, reinterpret_cast<void *>(input_channel),
+      reinterpret_cast<void *>(output_channel), static_cast<double>(first_in),
+      static_cast<double>(first_out));
 }
 
-// Save the arguments, run the stock callback, restore them, then report. The original's return
-// value is preserved across our reporter.
-// A Process trampoline with a half on each side of the stock call.
+// Save the arguments, run the stock callback, restore them, then report. The
+// original's return value is preserved across our reporter. A Process
+// trampoline with a half on each side of the stock call.
 //
-// The five arguments (this, timebase, input, output, frames) go to the stack on entry, because the
-// stock call clobbers every one of those registers and the second half needs them again. The stock
-// return value is kept in the same frame and handed back untouched - we never have to know its type.
-#define BRIDGE_PROCESS_THUNK(name, target) \
-    ".text\n" \
-    ".globl " name "\n" \
-    ".hidden " name "\n" \
-    ".type " name ", @function\n" \
-    name ":\n" \
-    "  .cfi_startproc\n" \
-    "  pushq %rbp\n" \
-    "  .cfi_def_cfa_offset 16\n" \
-    "  .cfi_offset %rbp, -16\n" \
-    "  movq %rsp, %rbp\n" \
-    "  .cfi_def_cfa_register %rbp\n" \
-    "  subq $48, %rsp\n" \
-    "  movq %rdi, -8(%rbp)\n" \
-    "  movq %rsi, -16(%rbp)\n" \
-    "  movq %rdx, -24(%rbp)\n" \
-    "  movq %rcx, -32(%rbp)\n" \
-    "  movq %r8, -40(%rbp)\n" \
-    "  call BridgeBeforeProcess\n" \
-    "  movq -8(%rbp), %rdi\n" \
-    "  movq -16(%rbp), %rsi\n" \
-    "  movq -24(%rbp), %rdx\n" \
-    "  movq -32(%rbp), %rcx\n" \
-    "  movq -40(%rbp), %r8\n" \
-    "  call *" target "(%rip)\n" \
-    "  movq %rax, -48(%rbp)\n" \
-    "  movq -8(%rbp), %rdi\n" \
-    "  movq -16(%rbp), %rsi\n" \
-    "  movq -24(%rbp), %rdx\n" \
-    "  movq -32(%rbp), %rcx\n" \
-    "  movq -40(%rbp), %r8\n" \
-    "  call BridgeAfterProcess\n" \
-    "  movq -48(%rbp), %rax\n" \
-    "  movq %rbp, %rsp\n" \
-    "  popq %rbp\n" \
-    "  .cfi_def_cfa %rsp, 8\n" \
-    "  ret\n" \
-    "  .cfi_endproc\n" \
-    ".size " name ", .-" name "\n"
+// The five arguments (this, timebase, input, output, frames) go to the stack on
+// entry, because the stock call clobbers every one of those registers and the
+// second half needs them again. The stock return value is kept in the same
+// frame and handed back untouched - we never have to know its type.
+#define BRIDGE_PROCESS_THUNK(name, target)                                     \
+  ".text\n"                                                                    \
+  ".globl " name "\n"                                                          \
+  ".hidden " name "\n"                                                         \
+  ".type " name ", @function\n" name ":\n"                                     \
+  "  .cfi_startproc\n"                                                         \
+  "  pushq %rbp\n"                                                             \
+  "  .cfi_def_cfa_offset 16\n"                                                 \
+  "  .cfi_offset %rbp, -16\n"                                                  \
+  "  movq %rsp, %rbp\n"                                                        \
+  "  .cfi_def_cfa_register %rbp\n"                                             \
+  "  subq $48, %rsp\n"                                                         \
+  "  movq %rdi, -8(%rbp)\n"                                                    \
+  "  movq %rsi, -16(%rbp)\n"                                                   \
+  "  movq %rdx, -24(%rbp)\n"                                                   \
+  "  movq %rcx, -32(%rbp)\n"                                                   \
+  "  movq %r8, -40(%rbp)\n"                                                    \
+  "  call BridgeBeforeProcess\n"                                               \
+  "  movq -8(%rbp), %rdi\n"                                                    \
+  "  movq -16(%rbp), %rsi\n"                                                   \
+  "  movq -24(%rbp), %rdx\n"                                                   \
+  "  movq -32(%rbp), %rcx\n"                                                   \
+  "  movq -40(%rbp), %r8\n"                                                    \
+  "  call *" target "(%rip)\n"                                                 \
+  "  movq %rax, -48(%rbp)\n"                                                   \
+  "  movq -8(%rbp), %rdi\n"                                                    \
+  "  movq -16(%rbp), %rsi\n"                                                   \
+  "  movq -24(%rbp), %rdx\n"                                                   \
+  "  movq -32(%rbp), %rcx\n"                                                   \
+  "  movq -40(%rbp), %r8\n"                                                    \
+  "  call BridgeAfterProcess\n"                                                \
+  "  movq -48(%rbp), %rax\n"                                                   \
+  "  movq %rbp, %rsp\n"                                                        \
+  "  popq %rbp\n"                                                              \
+  "  .cfi_def_cfa %rsp, 8\n"                                                   \
+  "  ret\n"                                                                    \
+  "  .cfi_endproc\n"                                                           \
+  ".size " name ", .-" name "\n"
 
-#define BRIDGE_AUDIO_THUNK(name, target, reporter) \
-    ".text\n"                                      \
-    ".globl " name "\n"                            \
-    ".hidden " name "\n"                           \
-    ".type " name ", @function\n"                  \
-    name ":\n"                                     \
-    "  pushq %rbp\n"                               \
-    "  movq %rsp, %rbp\n"                          \
-    "  pushq %rdi\n"                               \
-    "  pushq %rsi\n"                               \
-    "  pushq %rdx\n"                               \
-    "  pushq %rcx\n"                               \
-    "  pushq %r8\n"                                \
-    "  pushq %r9\n"                                \
-    "  call *" target "(%rip)\n"                   \
-    "  popq %r9\n"                                 \
-    "  popq %r8\n"                                 \
-    "  popq %rcx\n"                                \
-    "  popq %rdx\n"                                \
-    "  popq %rsi\n"                                \
-    "  popq %rdi\n"                                \
-    "  pushq %rax\n"                               \
-    "  subq $8, %rsp\n"                            \
-    "  call " reporter "\n"                        \
-    "  addq $8, %rsp\n"                            \
-    "  popq %rax\n"                                \
-    "  movq %rbp, %rsp\n"                          \
-    "  popq %rbp\n"                                \
-    "  ret\n"
+#define BRIDGE_AUDIO_THUNK(name, target, reporter)                             \
+  ".text\n"                                                                    \
+  ".globl " name "\n"                                                          \
+  ".hidden " name "\n"                                                         \
+  ".type " name ", @function\n" name ":\n"                                     \
+  "  pushq %rbp\n"                                                             \
+  "  movq %rsp, %rbp\n"                                                        \
+  "  pushq %rdi\n"                                                             \
+  "  pushq %rsi\n"                                                             \
+  "  pushq %rdx\n"                                                             \
+  "  pushq %rcx\n"                                                             \
+  "  pushq %r8\n"                                                              \
+  "  pushq %r9\n"                                                              \
+  "  call *" target "(%rip)\n"                                                 \
+  "  popq %r9\n"                                                               \
+  "  popq %r8\n"                                                               \
+  "  popq %rcx\n"                                                              \
+  "  popq %rdx\n"                                                              \
+  "  popq %rsi\n"                                                              \
+  "  popq %rdi\n"                                                              \
+  "  pushq %rax\n"                                                             \
+  "  subq $8, %rsp\n"                                                          \
+  "  call " reporter "\n"                                                      \
+  "  addq $8, %rsp\n"                                                          \
+  "  popq %rax\n"                                                              \
+  "  movq %rbp, %rsp\n"                                                        \
+  "  popq %rbp\n"                                                              \
+  "  ret\n"
 
-asm(BRIDGE_AUDIO_THUNK("BridgeThunkGetAudioInterface", "g_original_get_audio_interface", "BridgeAfterGetAudioInterface"));
-asm(BRIDGE_AUDIO_THUNK("BridgeThunkPreProcess", "g_original_pre_process", "BridgeAfterPreProcess"));
-asm(BRIDGE_AUDIO_THUNK("BridgeThunkPostProcess", "g_original_post_process", "BridgeAfterPostProcess"));
+asm(BRIDGE_AUDIO_THUNK("BridgeThunkGetAudioInterface",
+                       "g_original_get_audio_interface",
+                       "BridgeAfterGetAudioInterface"));
+asm(BRIDGE_AUDIO_THUNK("BridgeThunkPreProcess", "g_original_pre_process",
+                       "BridgeAfterPreProcess"));
+asm(BRIDGE_AUDIO_THUNK("BridgeThunkPostProcess", "g_original_post_process",
+                       "BridgeAfterPostProcess"));
 
 namespace {
 
-// Resolve builds more than one instance for a single effect on a track, and only one of them ends
-// up in the audio graph. Wrap every instance we are asked to create, not the first.
-void WrapInstance(void* instance)
-{
-    if (instance == nullptr) {
-        return;
-    }
+// Resolve builds more than one instance for a single effect on a track, and
+// only one of them ends up in the audio graph. Wrap every instance we are asked
+// to create, not the first.
+[[maybe_unused]] void WrapInstance(void *instance) {
+  if (instance == nullptr) {
+    return;
+  }
 
-    void** const current_vtable = *reinterpret_cast<void***>(instance);
-    if (current_vtable == &g_instance_vtable[2]) {
-        return;  // already ours
-    }
+  void **const current_vtable = *reinterpret_cast<void ***>(instance);
+  if (current_vtable == &g_instance_vtable[2]) {
+    return; // already ours
+  }
 
-    if (!g_instance_vtable_built) {
-        if (!SafeRead(current_vtable - 2, g_instance_vtable, sizeof(g_instance_vtable))) {
-            Log("  instance wrap skipped: vtable unreadable");
-            return;
-        }
-        g_original_get_audio_interface = g_instance_vtable[2 + kSlotGetAudioPluginInterface];
-        g_instance_vtable[2 + kSlotGetAudioPluginInterface] =
-            reinterpret_cast<void*>(&BridgeThunkGetAudioInterface);
-        g_original_pre_process = g_instance_vtable[2 + kSlotPreProcess];
-        g_original_post_process = g_instance_vtable[2 + kSlotPostProcess];
-        g_instance_vtable[2 + kSlotPreProcess] = reinterpret_cast<void*>(&BridgeThunkPreProcess);
-        g_instance_vtable[2 + kSlotPostProcess] = reinterpret_cast<void*>(&BridgeThunkPostProcess);
-        g_stock_instance_vtable = current_vtable;
-        g_instance_vtable_built = true;
-        Log("  built our instance vtable from %p: PreProcess %p, PostProcess %p",
-            static_cast<void*>(current_vtable), g_original_pre_process, g_original_post_process);
+  if (!g_instance_vtable_built) {
+    if (!SafeRead(current_vtable - 2, g_instance_vtable,
+                  sizeof(g_instance_vtable))) {
+      Log("  instance wrap skipped: vtable unreadable");
+      return;
     }
+    g_original_get_audio_interface =
+        g_instance_vtable[2 + kSlotGetAudioPluginInterface];
+    g_instance_vtable[2 + kSlotGetAudioPluginInterface] =
+        reinterpret_cast<void *>(&BridgeThunkGetAudioInterface);
+    g_original_pre_process = g_instance_vtable[2 + kSlotPreProcess];
+    g_original_post_process = g_instance_vtable[2 + kSlotPostProcess];
+    g_instance_vtable[2 + kSlotPreProcess] =
+        reinterpret_cast<void *>(&BridgeThunkPreProcess);
+    g_instance_vtable[2 + kSlotPostProcess] =
+        reinterpret_cast<void *>(&BridgeThunkPostProcess);
+    g_stock_instance_vtable = current_vtable;
+    g_instance_vtable_built = true;
+    Log("  built our instance vtable from %p: PreProcess %p, PostProcess %p",
+        static_cast<void *>(current_vtable), g_original_pre_process,
+        g_original_post_process);
+  }
 
-    // Our shared copy is only valid for the class we copied it from.
-    if (current_vtable != g_stock_instance_vtable) {
-        Log("  instance %p has vtable %p, not the one we copied (%p) - left alone",
-            instance, static_cast<void*>(current_vtable), g_stock_instance_vtable);
-        return;
-    }
+  // Our shared copy is only valid for the class we copied it from.
+  if (current_vtable != g_stock_instance_vtable) {
+    Log("  instance %p has vtable %p, not the one we copied (%p) - left alone",
+        instance, static_cast<void *>(current_vtable), g_stock_instance_vtable);
+    return;
+  }
 
-    if (!MakeWritable(instance)) {
-        Log("  instance wrap skipped: the object is not writable");
-        return;
-    }
-    *reinterpret_cast<void***>(instance) = &g_instance_vtable[2];
-    ++g_instances_wrapped;
-    Log("  instance %p wrapped (%d so far)", instance, g_instances_wrapped);
+  if (!MakeWritable(instance)) {
+    Log("  instance wrap skipped: the object is not writable");
+    return;
+  }
+  *reinterpret_cast<void ***>(instance) = &g_instance_vtable[2];
+  ++g_instances_wrapped;
+  Log("  instance %p wrapped (%d so far)", instance, g_instances_wrapped);
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Instantiating our entry.
 //
-// CreatePluginInstance(bmd::PluginCategory, QString const&) const returns a pointer, so there is no
-// sret here: rdi = this, esi = category, rdx = &QString. The stock factory has no effect under our
-// key, so selecting our entry produces nothing. Until we build our own bmd::PluginInstance, the
-// trampoline swaps the QString argument for the source key, and Resolve builds the effect we cloned.
+// CreatePluginInstance(bmd::PluginCategory, QString const&) const returns a
+// pointer, so there is no sret here: rdi = this, esi = category, rdx =
+// &QString. The stock factory has no effect under our key, so selecting our
+// entry produces nothing. Until we build our own bmd::PluginInstance, the
+// trampoline swaps the QString argument for the source key, and Resolve builds
+// the effect we cloned.
 // ---------------------------------------------------------------------------
 
 namespace {
 
 StaticQtString g_source_key_string;
-void* g_source_key_slot = nullptr;
+void *g_source_key_slot = nullptr;
 int g_create_inspections = 0;
 
 // Read the QString a `QString const&` argument points at.
-bool ReadQStringArgument(const void* reference, char* out, size_t out_size)
-{
-    unsigned long data_pointer = 0;
-    if (!SafeRead(reference, &data_pointer, sizeof(data_pointer))) {
-        return false;
-    }
-    return ReadQStringData(reinterpret_cast<const void*>(data_pointer), out, out_size);
+bool ReadQStringArgument(const void *reference, char *out, size_t out_size) {
+  unsigned long data_pointer = 0;
+  if (!SafeRead(reference, &data_pointer, sizeof(data_pointer))) {
+    return false;
+  }
+  return ReadQStringData(reinterpret_cast<const void *>(data_pointer), out,
+                         out_size);
 }
 
-}  // namespace
+} // namespace
 
 // Switches, with the proven arrangement as the default.
 //
-// Each of these was bisected on 2026-08-24 rather than reasoned about, because reasoning about
-// them produced three wrong answers in a row. Set a switch to "0" to turn a default-on behaviour
-// off, or to "1" to turn a default-off one on.
+// Each of these was bisected on 2026-08-24 rather than reasoned about, because
+// reasoning about them produced three wrong answers in a row. Set a switch to
+// "0" to turn a default-on behaviour off, or to "1" to turn a default-off one
+// on.
 //
-//   FXBRIDGE_RENAME          on   the effect names itself after the hosted plugin
-//   FXBRIDGE_EMPTY_PANEL     on   empties the panel by truncating the tree's item list, leaving
-//                                 the slot header and its bypass toggle. ON because the stock
-//                                 panel is not cosmetic: its knobs call SetParameterValue, and
-//                                 that was writing stray parameters into the hosted plugin - see
-//                                 BridgeOnSetParameter. Set it to 0 to get the carrier's panel
-//                                 back; the crash once seen on this path was a first attempt that
-//                                 skipped the builder, which this code no longer does.
-//   FXBRIDGE_PRIMARY_PROCESS off  hooks Process at +0x4d0 as well - this one crashed Resolve
-static bool EnabledByEnvironment(const char* name, bool on_by_default = false)
-{
-    const char* const value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') {
-        return on_by_default;
-    }
-    return value[0] != '0';
+//   FXBRIDGE_RENAME          on   the effect names itself after the hosted
+//   plugin FXBRIDGE_EMPTY_PANEL     on   empties the panel by truncating the
+//   tree's item list, leaving
+//                                 the slot header and its bypass toggle. ON
+//                                 because the stock panel is not cosmetic: its
+//                                 knobs call SetParameterValue, and that was
+//                                 writing stray parameters into the hosted
+//                                 plugin - see BridgeOnSetParameter. Set it to
+//                                 0 to get the carrier's panel back; the crash
+//                                 once seen on this path was a first attempt
+//                                 that skipped the builder, which this code no
+//                                 longer does.
+//   FXBRIDGE_PRIMARY_PROCESS off  hooks Process at +0x4d0 as well - this one
+//   crashed Resolve
+static bool EnabledByEnvironment(const char *name, bool on_by_default = false) {
+  const char *const value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return on_by_default;
+  }
+  return value[0] != '0';
 }
 
 extern "C" void BridgeSuppressStockUserInterface(bool on);
 
 // Returns a replacement for the QString argument, or null to leave it alone.
-extern "C" void* BridgeInspectCreateEntry(const void* self, unsigned long category, const void* key)
-{
-    (void)self;
+extern "C" void *BridgeInspectCreateEntry(const void *self,
+                                          unsigned long category,
+                                          const void *key) {
+  (void)self;
 
-    char name[160];
-    const bool readable = ReadQStringArgument(key, name, sizeof(name));
-    const Clone* const clone = readable ? CloneForKey(name) : nullptr;
+  char name[160];
+  const bool readable = ReadQStringArgument(key, name, sizeof(name));
+  const Clone *const clone = readable ? CloneForKey(name) : nullptr;
 
-    if (++g_create_inspections <= kMaxLoggedCalls) {
-        Log("CreatePluginInstance #%d: category=%lu key=\"%s\"%s",
-            g_create_inspections, category, readable ? name : "<unreadable>",
-            clone != nullptr ? "  <- ours, substituting the source key" : "");
-    }
+  if (++g_create_inspections <= kMaxLoggedCalls) {
+    Log("CreatePluginInstance #%d: category=%lu key=\"%s\"%s",
+        g_create_inspections, category, readable ? name : "<unreadable>",
+        clone != nullptr ? "  <- ours, substituting the source key" : "");
+  }
 
-    g_creating_clone = clone;
-    if (clone == nullptr) {
-        return nullptr;
-    }
+  g_creating_clone = clone;
+  if (clone == nullptr) {
+    return nullptr;
+  }
 
-    // The control tree is built inside CreatePluginInstance, so claiming the instance afterwards is
-    // too late to stop it. The stock slot is redirected for the length of this one call and put
-    // back in the exit - the window is a single call on Resolve's own thread.
-    // No stock-vtable patch here. GenerateUserInterface is called on our own instance *after* the
-    // claim - the trace caught it twice through our copy - so the no-op in our vtable is enough.
-    // Patching the shared vtable for the length of the create call would hand our no-op to any
-    // other Delay being built on another thread.
+  // The control tree is built inside CreatePluginInstance, so claiming the
+  // instance afterwards is too late to stop it. The stock slot is redirected
+  // for the length of this one call and put back in the exit - the window is a
+  // single call on Resolve's own thread. No stock-vtable patch here.
+  // GenerateUserInterface is called on our own instance *after* the claim - the
+  // trace caught it twice through our copy - so the no-op in our vtable is
+  // enough. Patching the shared vtable for the length of the create call would
+  // hand our no-op to any other Delay being built on another thread.
 
-    if (g_source_key_slot == nullptr) {
-        InitStaticQtString(g_source_key_string, kSourcePluginKey);
-        g_source_key_slot = &g_source_key_string;
-    }
-    return &g_source_key_slot;
+  if (g_source_key_slot == nullptr) {
+    InitStaticQtString(g_source_key_string, kSourcePluginKey);
+    g_source_key_slot = &g_source_key_string;
+  }
+  return &g_source_key_slot;
 }
 
-extern "C" void BridgeClaimInstance(void* instance);
+extern "C" void BridgeClaimInstance(void *instance);
 
-extern "C" void BridgeInspectCreateExit(void* result)
-{
-    if (g_create_inspections <= kMaxLoggedCalls) {
-        Log("CreatePluginInstance #%d returned %p%s", g_create_inspections, result,
-            result == nullptr ? "  (nothing was created)" : "");
-    }
+extern "C" void BridgeInspectCreateExit(void *result) {
+  if (g_create_inspections <= kMaxLoggedCalls) {
+    Log("CreatePluginInstance #%d returned %p%s", g_create_inspections, result,
+        result == nullptr ? "  (nothing was created)" : "");
+  }
 
-    // Claim only what we asked for. A Delay the editor added stays a stock Delay, because its vptrs
-    // still point at the stock vtable - that is the whole reason the class vtable is no longer
-    // patched.
-    if (g_creating_clone != nullptr && result != nullptr) {
-        BridgeClaimInstance(result);
-    }
+  // Claim only what we asked for. A Delay the editor added stays a stock Delay,
+  // because its vptrs still point at the stock vtable - that is the whole
+  // reason the class vtable is no longer patched.
+  if (g_creating_clone != nullptr && result != nullptr) {
+    BridgeClaimInstance(result);
+  }
 
-    g_creating_clone = nullptr;  // the editor now follows Resolve's own open and close calls
+  g_creating_clone =
+      nullptr; // the editor now follows Resolve's own open and close calls
 }
-
-
-
 
 namespace {
 
-// Which plugin to run. Override with FXBRIDGE_CLAP; every plugin on this machine ships a .clap.
-const char kDefaultClapPlugin[] = "/home/jooshua/.clap/DragonflyHallReverb.clap";
+// Which plugin to run. Override with FXBRIDGE_CLAP; every plugin on this
+// machine ships a .clap.
+const char kDefaultClapPlugin[] =
+    "/home/jooshua/.clap/DragonflyHallReverb.clap";
 
-// Loggers only. Plugins are loaded per effect now, at claim time, not once at startup.
-void LoadConfiguredPlugin()
-{
-    if (EnabledByEnvironment("FXBRIDGE_CRASH_TRACE", true)) {
-        InstallFaultHandler();
-    }
-    CarlaHostSetLogger([](const char* line) { Log("%s", line); });
-    PluginInstanceSetLogger([](const char* line) { Log("%s", line); });
-    PluginScanSetLogger([](const char* line) { Log("%s", line); });
-    StateStoreSetLogger([](const char* line) { Log("%s", line); });
+// Loggers only. Plugins are loaded per effect now, at claim time, not once at
+// startup.
+void LoadConfiguredPlugin() {
+  if (EnabledByEnvironment("FXBRIDGE_CRASH_TRACE", true)) {
+    InstallFaultHandler();
+  }
+  CarlaHostSetLogger([](const char *line) { Log("%s", line); });
+  PluginInstanceSetLogger([](const char *line) { Log("%s", line); });
+  PluginScanSetLogger([](const char *line) { Log("%s", line); });
+  StateStoreSetLogger([](const char *line) { Log("%s", line); });
 
-    // Scan now, at library load, rather than on the first QueryPluginList call. The scan touches
-    // the filesystem, and QueryPluginList runs while Resolve builds its effect menu.
-    ScannedPlugins();
+  // Scan now, at library load, rather than on the first QueryPluginList call.
+  // The scan touches the filesystem, and QueryPluginList runs while Resolve
+  // builds its effect menu.
+  ScannedPlugins();
 
-    // Then give those entries a category. This has to run after the scan, because the table it
-    // writes has one row per scanned plugin, and before Fairlight reads the resource to build the
-    // menu - which is why it sits here at library load and not in the QueryPluginList hook.
-    FxCategoriesSetLogger([](const char* line) { Log("%s", line); });
-    FxCategoriesApply();
+  // Then give those entries a category. This has to run after the scan, because
+  // the table it writes has one row per scanned plugin, and before Fairlight
+  // reads the resource to build the menu - which is why it sits here at library
+  // load and not in the QueryPluginList hook.
+  FxCategoriesSetLogger([](const char *line) { Log("%s", line); });
+  FxCategoriesApply();
 }
 
-}  // namespace
-
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Knobs.
 //
-// BMDStereoDelay::SetParameterValue(unsigned int, float) at +0x310 is the call Resolve makes when a
-// knob on the panel moves. The index arrives in esi and the value in xmm0, so this trampoline runs
-// the reporter *before* the stock function and saves xmm0 across it - the stock code is free to
-// clobber the float register, our reporter is not.
+// BMDStereoDelay::SetParameterValue(unsigned int, float) at +0x310 is the call
+// Resolve makes when a knob on the panel moves. The index arrives in esi and
+// the value in xmm0, so this trampoline runs the reporter *before* the stock
+// function and saves xmm0 across it - the stock code is free to clobber the
+// float register, our reporter is not.
 //
-// The value's range is not documented anywhere, so this build reports what really arrives and only
-// forwards positions that are already normalised. The mapping is written after the numbers are in,
-// not before.
+// The value's range is not documented anywhere, so this build reports what
+// really arrives and only forwards positions that are already normalised. The
+// mapping is written after the numbers are in, not before.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1527,197 +1611,428 @@ constexpr size_t kInitializeEffectEditOffset = 0x250;
 constexpr size_t kGetEffectEditOffset = 0x260;
 constexpr size_t kCloseEffectEditOffset = 0x278;
 
-// The same four calls again, in the AudioPlugin base vtable that starts at +0x648. Resolve's
-// Fairlight engine holds an AudioPlugin*, so these thunks are the slots it really dials.
+// The same four calls again, in the AudioPlugin base vtable that starts at
+// +0x648. Resolve's Fairlight engine holds an AudioPlugin*, so these thunks are
+// the slots it really dials.
 constexpr size_t kHasEditorThunkOffset = 0x718;
 constexpr size_t kInitializeEffectEditThunkOffset = 0x7b0;
 constexpr size_t kGetEffectEditThunkOffset = 0x7b8;
 constexpr size_t kCloseEffectEditThunkOffset = 0x7d0;
 int g_knob_reports = 0;
 
-}  // namespace
+} // namespace
 
 extern "C" {
-BRIDGE_HIDDEN2 void* g_original_set_parameter = nullptr;
-BRIDGE_HIDDEN2 void* g_original_initialize_editor = nullptr;
-BRIDGE_HIDDEN2 void* g_original_close_editor = nullptr;
-BRIDGE_HIDDEN2 void* g_original_has_editor = nullptr;
-BRIDGE_HIDDEN2 void* g_original_get_effect_edit = nullptr;
-BRIDGE_HIDDEN2 void* g_original_has_editor_thunk = nullptr;
-BRIDGE_HIDDEN2 void* g_original_initialize_editor_thunk = nullptr;
-BRIDGE_HIDDEN2 void* g_original_get_effect_edit_thunk = nullptr;
-BRIDGE_HIDDEN2 void* g_original_close_editor_thunk = nullptr;
-BRIDGE_HIDDEN2 void BridgeOnSetParameter(void* self, unsigned int index, float value);
+BRIDGE_HIDDEN2 void *g_original_set_parameter = nullptr;
+BRIDGE_HIDDEN2 void *g_original_initialize_editor = nullptr;
+BRIDGE_HIDDEN2 void *g_original_close_editor = nullptr;
+BRIDGE_HIDDEN2 void *g_original_has_editor = nullptr;
+BRIDGE_HIDDEN2 void *g_original_get_effect_edit = nullptr;
+BRIDGE_HIDDEN2 void *g_original_has_editor_thunk = nullptr;
+BRIDGE_HIDDEN2 void *g_original_initialize_editor_thunk = nullptr;
+BRIDGE_HIDDEN2 void *g_original_get_effect_edit_thunk = nullptr;
+BRIDGE_HIDDEN2 void *g_original_close_editor_thunk = nullptr;
+BRIDGE_HIDDEN2 void BridgeOnSetParameter(void *self, unsigned int index,
+                                         float value);
 BRIDGE_HIDDEN2 void BridgeThunkSetParameter();
 }
 
-extern "C" void BridgeOnSetParameter(void* self, unsigned int index, float value)
-{
-    (void)self;
+extern "C" void BridgeOnSetParameter(void *self, unsigned int index,
+                                     float value) {
+  (void)self;
 
-    if (++g_knob_reports <= 24) {
-        Log("knob: index %u -> %.6f", index, static_cast<double>(value));
+  if (++g_knob_reports <= 24) {
+    Log("knob: index %u -> %.6f", index, static_cast<double>(value));
+  }
+
+  // The carrier's knobs are NOT the plugin's parameters, and binding them by
+  // index does damage.
+  //
+  // Measured on 2026-08-25: with the stock Delay panel on screen, dragging its
+  // Delay Time knob sent index 5 to the hosted plugin. On pp-track that
+  // silenced it - output at -inf, its own input meter flat - and the fault
+  // looked like a broken audio path for as long as nobody read the knob lines
+  // in the log. The index means one thing on the Delay and another on every
+  // plugin, so there is no mapping to find: the plugin's own editor is the
+  // interface.
+  //
+  // Set FXBRIDGE_KNOB_BINDING=1 to send them anyway, which is only useful for
+  // studying a plugin whose parameter order is known.
+
+  // The probe's own indices are a different matter. They sit above everything
+  // the carrier owns, so nothing in Resolve invented them and nothing in the
+  // Delay can reach them: a value that arrives here was stored by Resolve and
+  // handed back, which is the whole question the probe exists to answer.
+  if (g_param_probe) {
+    ClaimedEffect *const effect = FindEffectAny(self);
+    if (effect != nullptr && effect->stock_params != 0 &&
+        index >= effect->stock_params &&
+        index < effect->stock_params + kProbeParameters) {
+      const unsigned int slot = index - effect->stock_params;
+      const bool ours = value == ProbeSeed(slot);
+      effect->probe[slot] = value;
+      Log("probe: Resolve set parameter %u (probe %u) of \"%s\" to %.6f  <- %s",
+          index, slot,
+          effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
+          static_cast<double>(value),
+          ours ? "this run's own seed, so it proves nothing"
+               : "NOT this run's seed - it came out of the project");
     }
-
-    // The carrier's knobs are NOT the plugin's parameters, and binding them by index does damage.
-    //
-    // Measured on 2026-08-25: with the stock Delay panel on screen, dragging its Delay Time knob
-    // sent index 5 to the hosted plugin. On pp-track that silenced it - output at -inf, its own
-    // input meter flat - and the fault looked like a broken audio path for as long as nobody read
-    // the knob lines in the log. The index means one thing on the Delay and another on every
-    // plugin, so there is no mapping to find: the plugin's own editor is the interface.
-    //
-    // Set FXBRIDGE_KNOB_BINDING=1 to send them anyway, which is only useful for studying a plugin
-    // whose parameter order is known.
-
-    // The probe's own indices are a different matter. They sit above everything the carrier
-    // owns, so nothing in Resolve invented them and nothing in the Delay can reach them: a
-    // value that arrives here was stored by Resolve and handed back, which is the whole
-    // question the probe exists to answer.
-    if (g_param_probe) {
-        ClaimedEffect* const effect = FindEffectAny(self);
-        if (effect != nullptr && effect->stock_params != 0 && index >= effect->stock_params &&
-            index < effect->stock_params + kProbeParameters) {
-            const unsigned int slot = index - effect->stock_params;
-            const bool ours = value == ProbeSeed(slot);
-            effect->probe[slot] = value;
-            Log("probe: Resolve set parameter %u (probe %u) of \"%s\" to %.6f  <- %s", index, slot,
-                effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
-                static_cast<double>(value),
-                ours ? "this run's own seed, so it proves nothing"
-                     : "NOT this run's seed - it came out of the project");
-        }
-    }
+  }
 }
 
-// The editor gate. Resolve asks HasEditor() before it offers an external editor at all, and the
-// stock Delay answers false: its panel is the declarative UI, not a window of its own. So the
-// InitializeEffectEdit hook never fired. Answering true is what puts this plugin on the path that
-// VST-style plugins take - the one that ends in a window we own.
+// The editor gate. Resolve asks HasEditor() before it offers an external editor
+// at all, and the stock Delay answers false: its panel is the declarative UI,
+// not a window of its own. So the InitializeEffectEdit hook never fired.
+// Answering true is what puts this plugin on the path that VST-style plugins
+// take - the one that ends in a window we own.
 //
-// These four are plain C++ replacements, not assembly trampolines: every signature here is
-// integers and pointers only, so the compiler's own calling sequence is already correct.
+// These four are plain C++ replacements, not assembly trampolines: every
+// signature here is integers and pointers only, so the compiler's own calling
+// sequence is already correct.
 
 namespace {
 
 int g_editor_reports = 0;
 
-}  // namespace
+} // namespace
 
-extern "C" bool BridgeHasEditor(void* self)
-{
-    bool stock = false;
-    if (g_original_has_editor != nullptr) {
-        stock = reinterpret_cast<bool (*)(void*)>(g_original_has_editor)(self);
-    }
-    const ClaimedEffect* const effect = FindEffect(self);
-    const bool ours = effect != nullptr && effect->plugin != nullptr &&
-                      effect->plugin->ChannelCount() > 0;
-    if (++g_editor_reports <= 8) {
-        Log("HasEditor: stock says %s, we answer %s",
-            stock ? "true" : "false", (stock || ours) ? "true" : "false");
-    }
-    return stock || ours;
+extern "C" bool BridgeHasEditor(void *self) {
+  bool stock = false;
+  if (g_original_has_editor != nullptr) {
+    stock = reinterpret_cast<bool (*)(void *)>(g_original_has_editor)(self);
+  }
+  const ClaimedEffect *const effect = FindEffect(self);
+  const bool ours = effect != nullptr && effect->plugin != nullptr &&
+                    effect->plugin->ChannelCount() > 0;
+  if (++g_editor_reports <= 8) {
+    Log("HasEditor: stock says %s, we answer %s", stock ? "true" : "false",
+        (stock || ours) ? "true" : "false");
+  }
+  return stock || ours;
 }
 
-extern "C" void* BridgeGetEffectEdit(void* self)
-{
-    void* widget = nullptr;
-    if (g_original_get_effect_edit != nullptr) {
-        widget = reinterpret_cast<void* (*)(void*)>(g_original_get_effect_edit)(self);
+namespace {
+
+// The editor returned by GetEffectEdit is a Fairlight interface subobject.
+// Its fourth virtual function is ShowEditor(bool). Check the actual symbol
+// before touching the table; the method, not a return address in DoAction,
+// is the visibility signal. Keep the original adjusting thunk intact.
+constexpr size_t kPanelShowEditorSlot = 3;
+using PanelShowEditorFn = void (*)(void *, bool);
+using PanelGetterFn = void *(*)(void *);
+
+struct PanelHook {
+  void **vtable = nullptr;
+  PanelShowEditorFn original = nullptr;
+};
+struct PanelOwner {
+  ClaimedEffect *effect = nullptr;
+  void *widget = nullptr;
+  void *plugin_self = nullptr;
+  PanelGetterFn getter = nullptr;
+};
+
+std::mutex g_panel_lock;
+PanelHook g_panel_hooks[8];
+PanelOwner g_panel_owners[kMaxClaimedEffects];
+
+// The registry is append-only, so prefer the newest live claim if Resolve
+// has reused an address. Do not fall back to the focused effect.
+ClaimedEffect *FindPanelEffect(void *self) {
+  if (self == nullptr)
+    return nullptr;
+  const size_t count = g_effect_count.load(std::memory_order_acquire);
+  for (size_t i = count; i > 0; --i) {
+    ClaimedEffect &effect = g_effects[i - 1];
+    if ((effect.instance_key == self || effect.audio_plugin_key == self ||
+         effect.primary_base == self) &&
+        effect.plugin != nullptr && EffectIsLive(effect)) {
+      return &effect;
     }
-    Log("GetEffectEdit: stock returns %p", widget);
-    return widget;
+  }
+  return nullptr;
 }
 
-extern "C" long BridgeInitializeEffectEdit(void* self, const char* title, void* parent)
-{
-    Log("InitializeEffectEdit(\"%s\", %p)", title != nullptr ? title : "(null)", parent);
-    long result = 0;
-    if (g_original_initialize_editor != nullptr) {
-        result = reinterpret_cast<long (*)(void*, const char*, void*)>(
-            g_original_initialize_editor)(self, title, parent);
-    }
-    Log("InitializeEffectEdit: stock returned %ld, opening the hosted editor", result);
-    BridgeEditorShowFor(EffectOrFocused(self), "InitializeEffectEdit");
-    return result;
+void ForgetPanel(void *self) {
+  ClaimedEffect *effect = FindPanelEffect(self);
+  if (effect == nullptr)
+    return;
+  const std::lock_guard<std::mutex> guard(g_panel_lock);
+  g_panel_owners[effect - g_effects] = {};
 }
 
-extern "C" void BridgeCloseEffectEdit(void* self)
-{
-    Log("CloseEffectEdit");
-    BridgeEditorHideFor(EffectOrFocused(self), "CloseEffectEdit");
-    if (g_original_close_editor != nullptr) {
-        reinterpret_cast<void (*)(void*)>(g_original_close_editor)(self);
+void BridgePanelShowEditor(void *widget, bool show) {
+  void **vtable = nullptr;
+  PanelShowEditorFn original = nullptr;
+  PanelOwner owner{};
+  {
+    const std::lock_guard<std::mutex> guard(g_panel_lock);
+    if (SafeRead(widget, &vtable, sizeof(vtable))) {
+      for (const auto &hook : g_panel_hooks) {
+        if (hook.vtable == vtable) {
+          original = hook.original;
+          break;
+        }
+      }
     }
+    for (size_t i = kMaxClaimedEffects; i > 0; --i) {
+      const auto &candidate = g_panel_owners[i - 1];
+      if (candidate.widget == widget && candidate.effect != nullptr &&
+          EffectIsLive(*candidate.effect)) {
+        owner = candidate;
+        break;
+      }
+    }
+  }
+  // Never hold our registry lock while calling Resolve or a hosted plugin.
+  // Native effects also use this table; their original call must still run.
+  if (original == nullptr)
+    return;
+  original(widget, show);
+
+  // Confirm ownership again: the original method can close/rebuild a panel.
+  if (owner.effect == nullptr || owner.getter == nullptr ||
+      FindPanelEffect(owner.plugin_self) != owner.effect ||
+      owner.getter(owner.plugin_self) != widget)
+    return;
+  {
+    const std::lock_guard<std::mutex> guard(g_panel_lock);
+    const auto &current = g_panel_owners[owner.effect - g_effects];
+    if (current.widget != widget || current.effect != owner.effect)
+      return;
+  }
+  if (show) {
+    BridgeEditorShowFor(owner.effect, "ShowEditor(true)");
+  } else {
+    BridgeEditorHideFor(owner.effect, "ShowEditor(false)");
+  }
 }
 
-// The AudioPlugin-base copies. `self` arrives pointing at the AudioPlugin subobject, and the saved
-// slot value is the thunk itself, so passing `self` straight through keeps the adjustment correct.
-
-extern "C" bool BridgeHasEditorThunk(void* self)
-{
-    bool stock = false;
-    if (g_original_has_editor_thunk != nullptr) {
-        stock = reinterpret_cast<bool (*)(void*)>(g_original_has_editor_thunk)(self);
-    }
-    // The rule: if a host window exists AND Resolve has a control tree to hang an editor on, this
-    // effect has an editor.
-    //
-    // The second half is not optional. The stock answer follows the control tree: true while the
-    // Delay knobs are there, false once GenerateUserInterface is suppressed. Answering true anyway
-    // makes Resolve build its editor from a tree that was never built, and the first virtual call
-    // on that object jumps to a garbage address - measured 2026-08-24, SIGSEGV with the faulting
-    // frame at 0x3306 and nothing below it.
-    //
-    // So an empty panel and Resolve's own show button are mutually exclusive, and the switch that
-    // removes the panel also gives up the button.
-    // Safe again: the empty panel is now a built tree with its items removed, not an unbuilt one,
-    // so Resolve has something valid to hang an editor on.
-    const ClaimedEffect* const effect = FindEffect(self);
-    const bool ours = effect != nullptr && effect->plugin != nullptr &&
-                      effect->plugin->ChannelCount() > 0;
-    if (++g_editor_reports <= 8) {
-        Log("AudioPlugin::HasEditor: stock says %s, we answer %s",
-            stock ? "true" : "false", (stock || ours) ? "true" : "false");
-    }
-    return stock || ours;
+// Accept the named method or a non-virtual adjusting thunk. The adjustment
+// itself is compiler/layout dependent; the saved thunk performs it for us.
+bool IsPanelShowEditorSymbol(const char *symbol) {
+  if (symbol == nullptr)
+    return false;
+  const char *name = symbol;
+  if (std::strncmp(name, "_ZThn", 5) == 0) {
+    name += 5;
+    const char *digits = name;
+    while (*name >= '0' && *name <= '9')
+      ++name;
+    if (name == digits || *name != '_')
+      return false;
+    ++name;
+  } else if (std::strncmp(name, "_Z", 2) == 0) {
+    name += 2;
+  } else {
+    return false;
+  }
+  return std::strcmp(name, "N15FLPluginUIPanel10ShowEditorEb") == 0 ||
+         std::strcmp(name, "N21UiEffectEditDialogImp10ShowEditorEb") == 0;
 }
 
-extern "C" void* BridgeGetEffectEditThunk(void* self)
-{
-    void* widget = nullptr;
-    if (g_original_get_effect_edit_thunk != nullptr) {
-        widget = reinterpret_cast<void* (*)(void*)>(g_original_get_effect_edit_thunk)(self);
-    }
-    Log("AudioPlugin::GetEffectEdit: stock returns %p", widget);
-    return widget;
+// Unlike the bridge's own vtable, this table is shared with Fairlight. Restore
+// its original page protection after writing the one entry.
+int PanelPageProtection(const void *address) {
+  std::FILE *maps = std::fopen("/proc/self/maps", "r");
+  if (maps == nullptr)
+    return -1;
+  const auto target = reinterpret_cast<uintptr_t>(address);
+  char line[512];
+  int protection = -1;
+  while (std::fgets(line, sizeof(line), maps) != nullptr) {
+    unsigned long start = 0, end = 0;
+    char permissions[5] = {};
+    if (std::sscanf(line, "%lx-%lx %4s", &start, &end, permissions) != 3 ||
+        target < start || target >= end)
+      continue;
+    protection = 0;
+    if (permissions[0] == 'r') protection |= PROT_READ;
+    if (permissions[1] == 'w') protection |= PROT_WRITE;
+    if (permissions[2] == 'x') protection |= PROT_EXEC;
+    break;
+  }
+  std::fclose(maps);
+  return protection;
 }
 
-// The return is not a bool: the stock call answered 136 on the first run, and a `bool` return type
-// truncates that to the low byte at -O2. Take it as a machine word and hand back exactly what the
-// stock code produced - we do not know what Resolve reads out of it.
-extern "C" long BridgeInitializeEffectEditThunk(void* self, const char* title, void* parent)
-{
-    Log("AudioPlugin::InitializeEffectEdit(\"%s\", %p)",
-        title != nullptr ? title : "(null)", parent);
-    long result = 0;
-    if (g_original_initialize_editor_thunk != nullptr) {
-        result = reinterpret_cast<long (*)(void*, const char*, void*)>(
-            g_original_initialize_editor_thunk)(self, title, parent);
+void RememberPanel(void *self, void *widget, PanelGetterFn getter) {
+  ClaimedEffect *effect = FindPanelEffect(self);
+  if (effect == nullptr)
+    return;
+  const std::lock_guard<std::mutex> guard(g_panel_lock);
+  auto &owner = g_panel_owners[effect - g_effects];
+  owner = {};
+  if (widget == nullptr)
+    return;
+  void **vtable = nullptr;
+  void *method = nullptr;
+  if (!SafeRead(widget, &vtable, sizeof(vtable)) || vtable == nullptr ||
+      !SafeRead(vtable + kPanelShowEditorSlot, &method, sizeof(method)))
+    return;
+
+  PanelHook *free_hook = nullptr;
+  PanelHook *known = nullptr;
+  for (auto &hook : g_panel_hooks) {
+    if (hook.vtable == vtable) {
+      known = &hook;
+      break;
     }
-    Log("AudioPlugin::InitializeEffectEdit: stock returned %ld, opening the hosted editor", result);
-    BridgeEditorShowFor(EffectOrFocused(self), "AudioPlugin::InitializeEffectEdit");
-    return result;
+    if (hook.vtable == nullptr && free_hook == nullptr)
+      free_hook = &hook;
+  }
+  if (known == nullptr) {
+    Dl_info info{};
+    if (free_hook == nullptr || !dladdr(method, &info) ||
+        info.dli_sname == nullptr || info.dli_saddr != method ||
+        !IsPanelShowEditorSymbol(info.dli_sname)) {
+      static bool reported = false;
+      if (!reported) {
+        Log("editor: unsupported ShowEditor slot; visibility hook skipped");
+        reported = true;
+      }
+      return;
+    }
+    auto *slot = vtable + kPanelShowEditorSlot;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const int protection = PanelPageProtection(slot);
+    if (page_size <= 0 || protection < 0) {
+      Log("editor: cannot determine ShowEditor page protection; hook skipped");
+      return;
+    }
+    const auto address = reinterpret_cast<uintptr_t>(slot);
+    auto *page = reinterpret_cast<void *>(address - address % page_size);
+    if (!(protection & PROT_WRITE) &&
+        mprotect(page, static_cast<size_t>(page_size),
+                 protection | PROT_WRITE) != 0) {
+      Log("editor: cannot make ShowEditor slot writable; hook skipped");
+      return;
+    }
+    free_hook->vtable = vtable;
+    free_hook->original = reinterpret_cast<PanelShowEditorFn>(method);
+    // Publish the original before publishing our replacement. The wrapper
+    // acquires the same lock before looking it up.
+    __atomic_store_n(slot, reinterpret_cast<void *>(&BridgePanelShowEditor),
+                     __ATOMIC_RELEASE);
+    if (!(protection & PROT_WRITE) &&
+        mprotect(page, static_cast<size_t>(page_size), protection) != 0) {
+      Log("editor: cannot restore ShowEditor page protection");
+    }
+    Log("editor: ShowEditor visibility hook installed (%s)", info.dli_sname);
+  }
+  // If a panel address has been recycled, only its latest owner may use it.
+  for (auto &previous : g_panel_owners) {
+    if (&previous != &owner && previous.widget == widget)
+      previous = {};
+  }
+  owner = {effect, widget, self, getter};
 }
 
-extern "C" void BridgeCloseEffectEditThunk(void* self)
-{
-    Log("AudioPlugin::CloseEffectEdit");
-    BridgeEditorHideFor(EffectOrFocused(self), "AudioPlugin::CloseEffectEdit");
-    if (g_original_close_editor_thunk != nullptr) {
-        reinterpret_cast<void (*)(void*)>(g_original_close_editor_thunk)(self);
-    }
+} // namespace
+
+extern "C" void *BridgeGetEffectEdit(void *self) {
+  const auto getter =
+      reinterpret_cast<PanelGetterFn>(g_original_get_effect_edit);
+  void *widget = getter != nullptr ? getter(self) : nullptr;
+  RememberPanel(self, widget, getter);
+  return widget;
+}
+
+extern "C" long BridgeInitializeEffectEdit(void *self, const char *title,
+                                           void *parent) {
+  Log("InitializeEffectEdit(\"%s\", %p)", title != nullptr ? title : "(null)",
+      parent);
+  long result = 0;
+  if (g_original_initialize_editor != nullptr) {
+    result = reinterpret_cast<long (*)(void *, const char *, void *)>(
+        g_original_initialize_editor)(self, title, parent);
+  }
+  Log("InitializeEffectEdit: stock returned %ld, opening the hosted editor",
+      result);
+  BridgeEditorShowFor(FindPanelEffect(self), "InitializeEffectEdit");
+  return result;
+}
+
+extern "C" void BridgeCloseEffectEdit(void *self) {
+  ForgetPanel(self);
+  Log("CloseEffectEdit");
+  BridgeEditorHideFor(FindPanelEffect(self), "CloseEffectEdit");
+  if (g_original_close_editor != nullptr) {
+    reinterpret_cast<void (*)(void *)>(g_original_close_editor)(self);
+  }
+}
+
+// The AudioPlugin-base copies. `self` arrives pointing at the AudioPlugin
+// subobject, and the saved slot value is the thunk itself, so passing `self`
+// straight through keeps the adjustment correct.
+
+extern "C" bool BridgeHasEditorThunk(void *self) {
+  bool stock = false;
+  if (g_original_has_editor_thunk != nullptr) {
+    stock =
+        reinterpret_cast<bool (*)(void *)>(g_original_has_editor_thunk)(self);
+  }
+  // The rule: if a host window exists AND Resolve has a control tree to hang an
+  // editor on, this effect has an editor.
+  //
+  // The second half is not optional. The stock answer follows the control tree:
+  // true while the Delay knobs are there, false once GenerateUserInterface is
+  // suppressed. Answering true anyway makes Resolve build its editor from a
+  // tree that was never built, and the first virtual call on that object jumps
+  // to a garbage address - measured 2026-08-24, SIGSEGV with the faulting frame
+  // at 0x3306 and nothing below it.
+  //
+  // So an empty panel and Resolve's own show button are mutually exclusive, and
+  // the switch that removes the panel also gives up the button. Safe again: the
+  // empty panel is now a built tree with its items removed, not an unbuilt one,
+  // so Resolve has something valid to hang an editor on.
+  const ClaimedEffect *const effect = FindEffect(self);
+  const bool ours = effect != nullptr && effect->plugin != nullptr &&
+                    effect->plugin->ChannelCount() > 0;
+  if (++g_editor_reports <= 8) {
+    Log("AudioPlugin::HasEditor: stock says %s, we answer %s",
+        stock ? "true" : "false", (stock || ours) ? "true" : "false");
+  }
+  return stock || ours;
+}
+
+extern "C" void *BridgeGetEffectEditThunk(void *self) {
+  const auto getter =
+      reinterpret_cast<PanelGetterFn>(g_original_get_effect_edit_thunk);
+  void *widget = getter != nullptr ? getter(self) : nullptr;
+  RememberPanel(self, widget, getter);
+  return widget;
+}
+
+// The return is not a bool: the stock call answered 136 on the first run, and a
+// `bool` return type truncates that to the low byte at -O2. Take it as a
+// machine word and hand back exactly what the stock code produced - we do not
+// know what Resolve reads out of it.
+extern "C" long BridgeInitializeEffectEditThunk(void *self, const char *title,
+                                                void *parent) {
+  Log("AudioPlugin::InitializeEffectEdit(\"%s\", %p)",
+      title != nullptr ? title : "(null)", parent);
+  long result = 0;
+  if (g_original_initialize_editor_thunk != nullptr) {
+    result = reinterpret_cast<long (*)(void *, const char *, void *)>(
+        g_original_initialize_editor_thunk)(self, title, parent);
+  }
+  Log("AudioPlugin::InitializeEffectEdit: stock returned %ld, opening the "
+      "hosted editor",
+      result);
+  BridgeEditorShowFor(FindPanelEffect(self),
+                      "AudioPlugin::InitializeEffectEdit");
+  return result;
+}
+
+extern "C" void BridgeCloseEffectEditThunk(void *self) {
+  ForgetPanel(self);
+  Log("AudioPlugin::CloseEffectEdit");
+  BridgeEditorHideFor(FindPanelEffect(self), "AudioPlugin::CloseEffectEdit");
+  if (g_original_close_editor_thunk != nullptr) {
+    reinterpret_cast<void (*)(void *)>(g_original_close_editor_thunk)(self);
+  }
 }
 
 asm(".text\n"
@@ -1735,7 +2050,8 @@ asm(".text\n"
     "  pushq %r9\n"
     "  subq $16, %rsp\n"
     "  movss %xmm0, (%rsp)\n"
-    "  call BridgeOnSetParameter\n"     // rdi, esi and xmm0 are already the right arguments
+    "  call BridgeOnSetParameter\n" // rdi, esi and xmm0 are already the right
+                                    // arguments
     "  movss (%rsp), %xmm0\n"
     "  addq $16, %rsp\n"
     "  popq %r9\n"
@@ -1753,19 +2069,24 @@ asm(".text\n"
 //
 // Two earlier attempts missed, and both were instructive:
 //
-//   * Patching the instance's vptr fails because CreatePluginInstance hands back a pointer to the
-//     secondary bmd::PluginInstance subobject (+0x4f8 into the class vtable group), not the object
-//     itself, and because those instances are short-lived - the address we wrapped was later reused
-//     as an audio buffer.
-//   * PreProcess/PostProcess(float**) are inherited helpers that nothing calls at runtime.
+//   * Patching the instance's vptr fails because CreatePluginInstance hands
+//   back a pointer to the
+//     secondary bmd::PluginInstance subobject (+0x4f8 into the class vtable
+//     group), not the object itself, and because those instances are
+//     short-lived - the address we wrapped was later reused as an audio buffer.
+//   * PreProcess/PostProcess(float**) are inherited helpers that nothing calls
+//   at runtime.
 //
-// The DSP entry point of every Fairlight effect is its own Process method - 74 classes define one:
+// The DSP entry point of every Fairlight effect is its own Process method - 74
+// classes define one:
 //
-//   BMDStereoDelay::Process(AudioPluginTimebaseInformation const*, float**, float**, unsigned long)
+//   BMDStereoDelay::Process(AudioPluginTimebaseInformation const*, float**,
+//   float**, unsigned long)
 //
-// It sits in the class vtable at +0x4d0, with a non-virtual thunk at +0x690 for calls made through
-// a secondary base pointer. Patching the class vtable once covers every instance, every lifetime
-// and both call paths. The vtable lives in RELRO, so it needs mprotect first.
+// It sits in the class vtable at +0x4d0, with a non-virtual thunk at +0x690 for
+// calls made through a secondary base pointer. Patching the class vtable once
+// covers every instance, every lifetime and both call paths. The vtable lives
+// in RELRO, so it needs mprotect first.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1776,525 +2097,576 @@ constexpr size_t kProcessThunkOffset = 0x690;
 
 int g_process_calls = 0;
 
-}  // namespace
-
+} // namespace
 
 extern "C" {
-BRIDGE_HIDDEN2 void* g_original_process_primary = nullptr;
-BRIDGE_HIDDEN2 void* g_original_process_thunk = nullptr;
-BRIDGE_HIDDEN2 void BridgeAfterProcess(void* self, const void* timebase, float** input,
-                                       float** output, unsigned long frames);
-BRIDGE_HIDDEN2 void BridgeBeforeProcess(void* self, const void* timebase, float** input,
-                                        float** output, unsigned long frames);
+BRIDGE_HIDDEN2 void *g_original_process_primary = nullptr;
+BRIDGE_HIDDEN2 void *g_original_process_thunk = nullptr;
+BRIDGE_HIDDEN2 void BridgeAfterProcess(void *self, const void *timebase,
+                                       float **input, float **output,
+                                       unsigned long frames);
+BRIDGE_HIDDEN2 void BridgeBeforeProcess(void *self, const void *timebase,
+                                        float **input, float **output,
+                                        unsigned long frames);
 BRIDGE_HIDDEN2 void BridgeThunkProcessPrimary();
 BRIDGE_HIDDEN2 void BridgeThunkProcessSecondary();
 }
 
-// Run a CLAP plugin over Resolve's buffers, and keep the stock effect out of the sound.
+// Run a CLAP plugin over Resolve's buffers, and keep the stock effect out of
+// the sound.
 //
-// The host class is BMDStereoDelay, so letting the stock Process run and then processing its output
-// puts an audible delay in front of the hosted plugin. Skipping the stock call outright would mean
-// inventing its return value, and two return types were already named wrongly today. So instead:
-// copy the dry input aside, let the stock call run and answer for itself, then put the dry signal
-// back and give the hosted plugin the untouched audio.
+// The host class is BMDStereoDelay, so letting the stock Process run and then
+// processing its output puts an audible delay in front of the hosted plugin.
+// Skipping the stock call outright would mean inventing its return value, and
+// two return types were already named wrongly today. So instead: copy the dry
+// input aside, let the stock call run and answer for itself, then put the dry
+// signal back and give the hosted plugin the untouched audio.
 //
-// The cost is one buffer copy per block. The gain is that the stock effect's own state still
-// advances and its return value reaches Resolve exactly as it would have.
+// The cost is one buffer copy per block. The gain is that the stock effect's
+// own state still advances and its return value reaches Resolve exactly as it
+// would have.
 //
-// Every channel pointer is validated and both ends of the block are probed before the plugin is
-// handed anything, so a surprising argument costs a skipped block instead of the application.
+// Every channel pointer is validated and both ends of the block are probed
+// before the plugin is handed anything, so a surprising argument costs a
+// skipped block instead of the application.
 
 namespace {
 
-// How many leading channels are genuinely usable: both ends of the block readable, and both ends
-// writable. Returns a count rather than a yes or no, because Resolve providing fewer channels than
-// the plugin wants is normal and must not cost the whole block.
-// How many channels Resolve really gave this effect.
+// How many leading channels are genuinely usable: both ends of the block
+// readable, and both ends writable. Returns a count rather than a yes or no,
+// because Resolve providing fewer channels than the plugin wants is normal and
+// must not cost the whole block. How many channels Resolve really gave this
+// effect.
 //
-// Read, never guessed. BMDAudioPluginImpl::UpdateChannelCount(int, int) writes both counts onto the
-// object, clamped by the plugin's own maxima:
+// Read, never guessed. BMDAudioPluginImpl::UpdateChannelCount(int, int) writes
+// both counts onto the object, clamped by the plugin's own maxima:
 //
 //   4eb952:  mov %rax,0x150(%rbx)     # input channels
 //   4eb975:  mov %rsi,0x158(%rbx)     # output channels
 //
-// and BMDStereoDelay::Process loops its channels against 0x158(%r12). Both are 64-bit.
+// and BMDStereoDelay::Process loops its channels against 0x158(%r12). Both are
+// 64-bit.
 //
-// This replaces a probe that walked the buffer array one entry at a time and stopped when an entry
-// failed a write test. That probe read `buffers[1]` before knowing whether index 1 existed - eight
-// bytes past the end of a one-entry array - and when those bytes happened to hold a writable
-// address, the block was copied over it. The crash then appeared on Resolve's mixing thread, in
-// AddChannelSourceToChannelBus, dereferencing a channel pointer that had never been filled.
+// This replaces a probe that walked the buffer array one entry at a time and
+// stopped when an entry failed a write test. That probe read `buffers[1]`
+// before knowing whether index 1 existed - eight bytes past the end of a
+// one-entry array - and when those bytes happened to hold a writable address,
+// the block was copied over it. The crash then appeared on Resolve's mixing
+// thread, in AddChannelSourceToChannelBus, dereferencing a channel pointer that
+// had never been filled.
 //
-// Those addresses and offsets are 21.1.0. 21.1.2 moved both counts by eight, so they are read
-// out of that same pair of instructions at load: g_layout.input_channels and .output_channels.
+// Those addresses and offsets are 21.1.0. 21.1.2 moved both counts by eight, so
+// they are read out of that same pair of instructions at load:
+// g_layout.input_channels and .output_channels.
 
 // The bypass switch on the effect's own header.
 //
-// Bypassing an effect in Fairlight does NOT stop Resolve calling Process. The stock effect is
-// still driven every block and checks this byte itself, taking a pass-through path when it is
-// set - BMDStereoDelay::Process opens with `cmpb $0x0,0x169(%r12)`. Our hook sits on the same
-// Process slot, so without this check the hosted plugin kept processing a "bypassed" effect.
+// Bypassing an effect in Fairlight does NOT stop Resolve calling Process. The
+// stock effect is still driven every block and checks this byte itself, taking
+// a pass-through path when it is set - BMDStereoDelay::Process opens with `cmpb
+// $0x0,0x169(%r12)`. Our hook sits on the same Process slot, so without this
+// check the hosted plugin kept processing a "bypassed" effect.
 //
 // Read out of BMDAudioPluginImpl::Bypass(bool), which is the only writer:
 //
 //   4eebc0+:  mov %sil,0x169(%rdi)
 //
-// 0x169 in 21.1.0, 0x171 in 21.1.2 - read out of that store at load, as g_layout.bypass_flag.
+// 0x169 in 21.1.0, 0x171 in 21.1.2 - read out of that store at load, as
+// g_layout.bypass_flag.
 
-bool EffectIsBypassed(const ClaimedEffect* effect)
-{
-    if (effect == nullptr || effect->primary_base == nullptr) {
-        return false;
-    }
-    unsigned char flag = 0;
-    const auto* const field =
-        static_cast<const unsigned char*>(effect->primary_base) + g_layout.bypass_flag;
-    if (!SafeRead(field, &flag, sizeof(flag))) {
-        return false;  // unreadable is not "bypassed" - do not silence audio on a failed read
-    }
-    return flag != 0;
+bool EffectIsBypassed(const ClaimedEffect *effect) {
+  if (effect == nullptr || effect->primary_base == nullptr) {
+    return false;
+  }
+  unsigned char flag = 0;
+  const auto *const field =
+      static_cast<const unsigned char *>(effect->primary_base) +
+      g_layout.bypass_flag;
+  if (!SafeRead(field, &flag, sizeof(flag))) {
+    return false; // unreadable is not "bypassed" - do not silence audio on a
+                  // failed read
+  }
+  return flag != 0;
 }
-unsigned int ChannelsResolveGave(const ClaimedEffect* effect, bool output)
-{
-    if (effect == nullptr || effect->primary_base == nullptr) {
-        return 0;
-    }
-    const auto* const field = static_cast<const unsigned char*>(effect->primary_base) +
-                              (output ? g_layout.output_channels : g_layout.input_channels);
-    unsigned long count = 0;
-    if (!SafeRead(field, &count, sizeof(count))) {
-        return 0;
-    }
-    return count <= kMaxChannels ? static_cast<unsigned int>(count) : 0;
-}
-
-unsigned int UsableChannels(float** buffers, unsigned int wanted, unsigned long frames)
-{
-    if (buffers == nullptr || frames == 0) {
-        return 0;
-    }
-    for (unsigned int channel = 0; channel < wanted; ++channel) {
-        unsigned long channel_pointer = 0;
-        if (!SafeRead(buffers + channel, &channel_pointer, sizeof(channel_pointer)) ||
-            channel_pointer == 0) {
-            return channel;
-        }
-        auto* const samples = reinterpret_cast<float*>(channel_pointer);
-        float probe = 0.0f;
-        if (!SafeRead(samples, &probe, sizeof(probe)) ||
-            !SafeRead(samples + frames - 1, &probe, sizeof(probe))) {
-            return channel;
-        }
-        if (!SafeWriteProbe(samples) || !SafeWriteProbe(samples + frames - 1)) {
-            return channel;
-        }
-    }
-    return wanted;
+unsigned int ChannelsResolveGave(const ClaimedEffect *effect, bool output) {
+  if (effect == nullptr || effect->primary_base == nullptr) {
+    return 0;
+  }
+  const auto *const field =
+      static_cast<const unsigned char *>(effect->primary_base) +
+      (output ? g_layout.output_channels : g_layout.input_channels);
+  unsigned long count = 0;
+  if (!SafeRead(field, &count, sizeof(count))) {
+    return 0;
+  }
+  return count <= kMaxChannels ? static_cast<unsigned int>(count) : 0;
 }
 
-}  // namespace
+unsigned int UsableChannels(float **buffers, unsigned int wanted,
+                            unsigned long frames) {
+  if (buffers == nullptr || frames == 0) {
+    return 0;
+  }
+  for (unsigned int channel = 0; channel < wanted; ++channel) {
+    unsigned long channel_pointer = 0;
+    if (!SafeRead(buffers + channel, &channel_pointer,
+                  sizeof(channel_pointer)) ||
+        channel_pointer == 0) {
+      return channel;
+    }
+    auto *const samples = reinterpret_cast<float *>(channel_pointer);
+    float probe = 0.0f;
+    if (!SafeRead(samples, &probe, sizeof(probe)) ||
+        !SafeRead(samples + frames - 1, &probe, sizeof(probe))) {
+      return channel;
+    }
+    if (!SafeWriteProbe(samples) || !SafeWriteProbe(samples + frames - 1)) {
+      return channel;
+    }
+  }
+  return wanted;
+}
 
-extern "C" void BridgeBeforeProcess(void* self, const void* timebase, float** input,
-                                    float** output, unsigned long frames)
-{
-    (void)timebase;
-    (void)output;
+} // namespace
 
-    ClaimedEffect* const effect = FindEffect(self);
-    if (effect == nullptr || effect->plugin == nullptr) {
-        return;
-    }
+extern "C" void BridgeBeforeProcess(void *self, const void *timebase,
+                                    float **input, float **output,
+                                    unsigned long frames) {
+  (void)timebase;
+  (void)output;
 
-    const unsigned int asked = effect->plugin->ChannelCount();
-    if (asked == 0 || asked > kMaxChannels || input == nullptr || frames == 0 ||
-        frames > kMaxFrames) {
-        effect->dry_frames = 0;
-        return;
-    }
-    if (EffectIsBypassed(effect)) {
-        effect->dry_frames = 0;
-        return;
-    }
-    const unsigned int given = ChannelsResolveGave(effect, false);
-    if (given == 0) {
-        effect->dry_frames = 0;
-        return;  // the count is unreadable; touching the array would be the old guess again
-    }
-    const unsigned int wanted = UsableChannels(input, asked < given ? asked : given, frames);
-    if (wanted == 0) {
-        effect->dry_frames = 0;
-        return;
-    }
+  ClaimedEffect *const effect = FindEffect(self);
+  if (effect == nullptr || effect->plugin == nullptr) {
+    return;
+  }
 
-    if (effect->dry.size() < static_cast<size_t>(wanted) * kMaxFrames) {
-        effect->dry_frames = 0;
-        return;  // allocated at claim time; never allocate on the audio thread
-    }
+  const unsigned int asked = effect->plugin->ChannelCount();
+  if (asked == 0 || asked > kMaxChannels || input == nullptr || frames == 0 ||
+      frames > kMaxFrames) {
+    effect->dry_frames = 0;
+    return;
+  }
+  if (EffectIsBypassed(effect)) {
+    effect->dry_frames = 0;
+    return;
+  }
+  const unsigned int given = ChannelsResolveGave(effect, false);
+  if (given == 0) {
+    effect->dry_frames = 0;
+    return; // the count is unreadable; touching the array would be the old
+            // guess again
+  }
+  const unsigned int wanted =
+      UsableChannels(input, asked < given ? asked : given, frames);
+  if (wanted == 0) {
+    effect->dry_frames = 0;
+    return;
+  }
 
-    for (unsigned int channel = 0; channel < wanted; ++channel) {
-        std::memcpy(&effect->dry[channel * kMaxFrames], input[channel], frames * sizeof(float));
-    }
-    effect->dry_frames = frames;
-    effect->dry_channels = wanted;
+  if (effect->dry.size() < static_cast<size_t>(wanted) * kMaxFrames) {
+    effect->dry_frames = 0;
+    return; // allocated at claim time; never allocate on the audio thread
+  }
+
+  for (unsigned int channel = 0; channel < wanted; ++channel) {
+    std::memcpy(&effect->dry[channel * kMaxFrames], input[channel],
+                frames * sizeof(float));
+  }
+  effect->dry_frames = frames;
+  effect->dry_channels = wanted;
 }
 
 // How long a hosted block may take before it is worth a line in the log.
 //
-// Resolve holds one lock per plugin for the whole of BMDAudioPluginImpl::PreProcess, and that is
-// the same lock BMDAudioPluginImpl::ResetHistory waits on - verified by disassembly: only five
-// functions in libBMDAudioPlugins.so lock `this+0x218`, and those two are among them. So a slow
-// call here does not merely drop audio, it freezes the interface: the next ClearAudioPreview on
-// the GUI thread queues behind us. Four dumps from Delirio on 2026-09-05 stop at exactly that
-// frame, and the last line the bridge wrote before each freeze was the ResetHistory probe.
+// Resolve holds one lock per plugin for the whole of
+// BMDAudioPluginImpl::PreProcess, and that is the same lock
+// BMDAudioPluginImpl::ResetHistory waits on - verified by disassembly: only
+// five functions in libBMDAudioPlugins.so lock `this+0x218`, and those two are
+// among them. So a slow call here does not merely drop audio, it freezes the
+// interface: the next ClearAudioPreview on the GUI thread queues behind us.
+// Four dumps from Delirio on 2026-09-05 stop at exactly that frame, and the
+// last line the bridge wrote before each freeze was the ResetHistory probe.
 //
-// Nothing is aborted. A VST3 process call through yabridge cannot be cancelled once it is in
-// flight, and pretending otherwise would trade a freeze for a corrupted plugin. What this buys is
-// the NAME of the plugin that stalled, which no dump so far has carried.
+// Nothing is aborted. A VST3 process call through yabridge cannot be cancelled
+// once it is in flight, and pretending otherwise would trade a freeze for a
+// corrupted plugin. What this buys is the NAME of the plugin that stalled,
+// which no dump so far has carried.
 //
-// A 1024-frame block at 48 kHz is 21 ms of audio, so 50 ms has already missed the deadline twice
-// over. FXBRIDGE_SLOW_MS moves it.
-long long SlowBlockMicroseconds()
-{
-    static const long long limit = [] {
-        const char* const set = std::getenv("FXBRIDGE_SLOW_MS");
-        const long long ms = set != nullptr ? std::atoll(set) : 50;
-        return (ms > 0 ? ms : 50) * 1000;
-    }();
-    return limit;
+// A 1024-frame block at 48 kHz is 21 ms of audio, so 50 ms has already missed
+// the deadline twice over. FXBRIDGE_SLOW_MS moves it.
+long long SlowBlockMicroseconds() {
+  static const long long limit = [] {
+    const char *const set = std::getenv("FXBRIDGE_SLOW_MS");
+    const long long ms = set != nullptr ? std::atoll(set) : 50;
+    return (ms > 0 ? ms : 50) * 1000;
+  }();
+  return limit;
 }
 
-void ReportSlowBlock(ClaimedEffect* effect, long long took_us, unsigned long frames)
-{
-    if (took_us <= SlowBlockMicroseconds()) {
-        return;
-    }
-    if (took_us > effect->worst_block_us) {
-        effect->worst_block_us = took_us;
-    }
-    // The first few, then decades. A stall storm must not become the log.
-    const unsigned int seen = effect->slow_blocks.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (seen <= 5 || seen == 10 || seen == 100 || seen == 1000 || seen % 10000 == 0) {
-        Log("audio: SLOW - \"%s\" took %lld.%03lld ms for %lu frames (block %u past the limit, "
-            "worst %lld.%03lld ms). Resolve holds the plugin lock for this whole call.",
-            effect->plugin->Name(), took_us / 1000, took_us % 1000, frames, seen,
-            effect->worst_block_us / 1000, effect->worst_block_us % 1000);
-    }
+void ReportSlowBlock(ClaimedEffect *effect, long long took_us,
+                     unsigned long frames) {
+  if (took_us <= SlowBlockMicroseconds()) {
+    return;
+  }
+  if (took_us > effect->worst_block_us) {
+    effect->worst_block_us = took_us;
+  }
+  // The first few, then decades. A stall storm must not become the log.
+  const unsigned int seen =
+      effect->slow_blocks.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (seen <= 5 || seen == 10 || seen == 100 || seen == 1000 ||
+      seen % 10000 == 0) {
+    Log("audio: SLOW - \"%s\" took %lld.%03lld ms for %lu frames (block %u "
+        "past the limit, "
+        "worst %lld.%03lld ms). Resolve holds the plugin lock for this whole "
+        "call.",
+        effect->plugin->Name(), took_us / 1000, took_us % 1000, frames, seen,
+        effect->worst_block_us / 1000, effect->worst_block_us % 1000);
+  }
 }
 
-extern "C" void BridgeAfterProcess(void* self, const void* timebase, float** input,
-                                   float** output, unsigned long frames)
-{
-    (void)timebase;
-    (void)input;
+extern "C" void BridgeAfterProcess(void *self, const void *timebase,
+                                   float **input, float **output,
+                                   unsigned long frames) {
+  (void)timebase;
+  (void)input;
 
-    // The breadcrumbs that found the writability fault are gone; the Process line below carries
-    // what is worth knowing per block. Put them back by hand if this path ever misbehaves again -
-    // step-by-step logging named the faulting statement in one run, after two wrong theories.
+  // The breadcrumbs that found the writability fault are gone; the Process line
+  // below carries what is worth knowing per block. Put them back by hand if
+  // this path ever misbehaves again - step-by-step logging named the faulting
+  // statement in one run, after two wrong theories.
 
-    ClaimedEffect* const effect = FindEffect(self);
-    if (effect == nullptr || effect->plugin == nullptr) {
-        return;  // not ours: a stock Delay elsewhere in the project
+  ClaimedEffect *const effect = FindEffect(self);
+  if (effect == nullptr || effect->plugin == nullptr) {
+    return; // not ours: a stock Delay elsewhere in the project
+  }
+
+  const unsigned int asked = effect->plugin->ChannelCount();
+  if (asked == 0 || output == nullptr || frames == 0 || frames > kMaxFrames) {
+    return;
+  }
+
+  // Bypassed: leave the block exactly as Resolve produced it. The stock effect
+  // has already passed the audio through, so doing nothing here is what bypass
+  // means.
+  if (EffectIsBypassed(effect)) {
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      Log("audio: the effect is bypassed - the hosted plugin is out of the "
+          "path");
     }
+    return;
+  }
 
-    const unsigned int asked = effect->plugin->ChannelCount();
-    if (asked == 0 || output == nullptr || frames == 0 || frames > kMaxFrames) {
-        return;
-    }
+  // Only the channels Resolve really gave us: the count comes off the object,
+  // and the buffers are then proven writable at both ends before anything is
+  // copied into them.
+  const unsigned int given = ChannelsResolveGave(effect, true);
+  if (given == 0) {
+    return;
+  }
+  const unsigned int wanted =
+      UsableChannels(output, asked < given ? asked : given, frames);
+  if (wanted == 0) {
+    return;
+  }
+  static unsigned int reported_short = 0;
+  if (wanted < asked && reported_short < 3) {
+    ++reported_short;
+    Log("audio: Resolve provided %u of the %u channels \"%s\" wants (it "
+        "reports %u out)",
+        wanted, asked, effect->plugin->Name(), given);
+  }
 
-    // Bypassed: leave the block exactly as Resolve produced it. The stock effect has already
-    // passed the audio through, so doing nothing here is what bypass means.
-    if (EffectIsBypassed(effect)) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            Log("audio: the effect is bypassed - the hosted plugin is out of the path");
-        }
-        return;
-    }
+  if (asked > kMaxChannels ||
+      effect->spare.size() < static_cast<size_t>(asked) * kMaxFrames) {
+    return;
+  }
 
-    // Only the channels Resolve really gave us: the count comes off the object, and the buffers
-    // are then proven writable at both ends before anything is copied into them.
-    const unsigned int given = ChannelsResolveGave(effect, true);
-    if (given == 0) {
-        return;
-    }
-    const unsigned int wanted = UsableChannels(output, asked < given ? asked : given, frames);
-    if (wanted == 0) {
-        return;
-    }
-    static unsigned int reported_short = 0;
-    if (wanted < asked && reported_short < 3) {
-        ++reported_short;
-        Log("audio: Resolve provided %u of the %u channels \"%s\" wants (it reports %u out)",
-            wanted, asked, effect->plugin->Name(), given);
-    }
+  // The plugin never sees Resolve's buffers.
+  //
+  // This is the fix for a crash inside Resolve's own mixer, and the reason is
+  // worth keeping: Resolve's block buffer holds exactly `frames` floats, and a
+  // plugin is free to write more than it was asked for. A limiter with
+  // lookahead that rounds its work up to an internal block does exactly that.
+  // The write lands past the end of a Fairlight heap buffer, and the fault then
+  // appears somewhere else entirely - the crash dump for pp-track on 2026-08-25
+  // pointed at MixPole::ApplyGainSmooth+0x188, which is `call *0x20(%rax)`
+  // through a vtable pointer that had been overwritten.
+  //
+  // So the plugin runs over our own scratch, which has kMaxFrames of headroom
+  // per channel, and exactly `frames` samples are copied back. An overrunning
+  // plugin now damages our spare and nothing else.
+  const bool have_dry =
+      effect->dry_frames == frames && effect->dry_channels == wanted &&
+      effect->dry.size() >= static_cast<size_t>(wanted) * kMaxFrames;
 
-    if (asked > kMaxChannels ||
-        effect->spare.size() < static_cast<size_t>(asked) * kMaxFrames) {
-        return;
+  for (unsigned int channel = 0; channel < asked; ++channel) {
+    float *const scratch = &effect->spare[channel * kMaxFrames];
+    // The real channels carry the dry signal, so the plugin hears the track and
+    // not the carrier effect's delayed copy of it. Channels Resolve did not
+    // provide carry a copy of the last real one, so a stereo plugin still runs
+    // on a mono track.
+    const unsigned int source = channel < wanted ? channel : wanted - 1;
+    if (have_dry) {
+      std::memcpy(scratch, &effect->dry[source * kMaxFrames],
+                  frames * sizeof(float));
+    } else {
+      std::memcpy(scratch, output[source], frames * sizeof(float));
     }
+    effect->channels[channel] = scratch;
+    // A marker just past the block. If the plugin writes over it, the overrun
+    // is measured instead of guessed - and it is measured in our memory, where
+    // it is harmless.
+    scratch[frames] = kOverrunMarker;
+  }
 
-    // The plugin never sees Resolve's buffers.
-    //
-    // This is the fix for a crash inside Resolve's own mixer, and the reason is worth keeping:
-    // Resolve's block buffer holds exactly `frames` floats, and a plugin is free to write more
-    // than it was asked for. A limiter with lookahead that rounds its work up to an internal block
-    // does exactly that. The write lands past the end of a Fairlight heap buffer, and the fault
-    // then appears somewhere else entirely - the crash dump for pp-track on 2026-08-25 pointed at
-    // MixPole::ApplyGainSmooth+0x188, which is `call *0x20(%rax)` through a vtable pointer that
-    // had been overwritten.
-    //
-    // So the plugin runs over our own scratch, which has kMaxFrames of headroom per channel, and
-    // exactly `frames` samples are copied back. An overrunning plugin now damages our spare and
-    // nothing else.
-    const bool have_dry = effect->dry_frames == frames && effect->dry_channels == wanted &&
-                          effect->dry.size() >= static_cast<size_t>(wanted) * kMaxFrames;
+  // The locate, honoured here rather than where it was announced. See
+  // reset_pending.
+  if (effect->reset_pending.exchange(false, std::memory_order_acq_rel)) {
+    effect->plugin->Reset();
+  }
 
-    for (unsigned int channel = 0; channel < asked; ++channel) {
-        float* const scratch = &effect->spare[channel * kMaxFrames];
-        // The real channels carry the dry signal, so the plugin hears the track and not the
-        // carrier effect's delayed copy of it. Channels Resolve did not provide carry a copy of
-        // the last real one, so a stereo plugin still runs on a mono track.
-        const unsigned int source = channel < wanted ? channel : wanted - 1;
-        if (have_dry) {
-            std::memcpy(scratch, &effect->dry[source * kMaxFrames], frames * sizeof(float));
-        } else {
-            std::memcpy(scratch, output[source], frames * sizeof(float));
-        }
-        effect->channels[channel] = scratch;
-        // A marker just past the block. If the plugin writes over it, the overrun is measured
-        // instead of guessed - and it is measured in our memory, where it is harmless.
-        scratch[frames] = kOverrunMarker;
+  const auto started = std::chrono::steady_clock::now();
+  const bool processed = effect->plugin->Process(
+      effect->channels, asked, static_cast<unsigned int>(frames));
+  ReportSlowBlock(effect,
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - started)
+                      .count(),
+                  frames);
+
+  bool overran = false;
+  for (unsigned int channel = 0; channel < asked; ++channel) {
+    float *const scratch = &effect->spare[channel * kMaxFrames];
+    if (scratch[frames] != kOverrunMarker) {
+      overran = true;
     }
-
-    // The locate, honoured here rather than where it was announced. See reset_pending.
-    if (effect->reset_pending.exchange(false, std::memory_order_acq_rel)) {
-        effect->plugin->Reset();
+    if (channel < wanted) {
+      std::memcpy(output[channel], scratch, frames * sizeof(float));
     }
+  }
 
-    const auto started = std::chrono::steady_clock::now();
-    const bool processed = effect->plugin->Process(effect->channels, asked,
-                                                   static_cast<unsigned int>(frames));
-    ReportSlowBlock(effect,
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - started).count(),
-                    frames);
+  static unsigned int reported_overrun = 0;
+  if (overran && reported_overrun < 3) {
+    ++reported_overrun;
+    Log("audio: \"%s\" wrote past the %lu frames it was given - contained in "
+        "our scratch",
+        effect->plugin->Name(), frames);
+  }
 
-    bool overran = false;
-    for (unsigned int channel = 0; channel < asked; ++channel) {
-        float* const scratch = &effect->spare[channel * kMaxFrames];
-        if (scratch[frames] != kOverrunMarker) {
-            overran = true;
-        }
-        if (channel < wanted) {
-            std::memcpy(output[channel], scratch, frames * sizeof(float));
-        }
-    }
-
-    static unsigned int reported_overrun = 0;
-    if (overran && reported_overrun < 3) {
-        ++reported_overrun;
-        Log("audio: \"%s\" wrote past the %lu frames it was given - contained in our scratch",
-            effect->plugin->Name(), frames);
-    }
-
-    if (++g_process_calls <= 3) {
-        Log("Process #%d: frames=%lu, %u of %u channels, dry %s, plugin %s",
-            g_process_calls, frames, wanted, asked, have_dry ? "used" : "MISSING",
-            processed ? "ran" : "declined");
-    }
+  if (++g_process_calls <= 3) {
+    Log("Process #%d: frames=%lu, %u of %u channels, dry %s, plugin %s",
+        g_process_calls, frames, wanted, asked, have_dry ? "used" : "MISSING",
+        processed ? "ran" : "declined");
+  }
 }
 
-asm(BRIDGE_PROCESS_THUNK("BridgeThunkProcessPrimary", "g_original_process_primary"));
-asm(BRIDGE_PROCESS_THUNK("BridgeThunkProcessSecondary", "g_original_process_thunk"));
+asm(BRIDGE_PROCESS_THUNK("BridgeThunkProcessPrimary",
+                         "g_original_process_primary"));
+asm(BRIDGE_PROCESS_THUNK("BridgeThunkProcessSecondary",
+                         "g_original_process_thunk"));
 
 namespace {
 
-// Replace one vtable entry in place. The two entries need separate trampolines: the primary slot
-// holds the function, the other holds a thunk that adjusts `this` before jumping to it.
-bool PatchVtableSlot(unsigned char* vtable, size_t offset, void** saved, void* replacement)
-{
-    auto* const slot = reinterpret_cast<void**>(vtable + offset);
-    if (!MakeWritable(slot)) {
-        return false;
-    }
-    *saved = *slot;
-    *slot = replacement;
-    return true;
+// Replace one vtable entry in place. The two entries need separate trampolines:
+// the primary slot holds the function, the other holds a thunk that adjusts
+// `this` before jumping to it.
+bool PatchVtableSlot(unsigned char *vtable, size_t offset, void **saved,
+                     void *replacement) {
+  auto *const slot = reinterpret_cast<void **>(vtable + offset);
+  if (!MakeWritable(slot)) {
+    return false;
+  }
+  *saved = *slot;
+  *slot = replacement;
+  return true;
 }
 
-
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // The editor trace.
 //
-// Closing the plugin window with the window manager's X unmaps it, and Resolve never hears about
-// it - the plugin has no way to tell the host that its editor went away, because AudioPluginHost
-// carries no such notification. So the panel button afterwards does whatever Resolve does when it
-// believes the editor is already open, and that is the thing to measure.
+// Closing the plugin window with the window manager's X unmaps it, and Resolve
+// never hears about it - the plugin has no way to tell the host that its editor
+// went away, because AudioPluginHost carries no such notification. So the panel
+// button afterwards does whatever Resolve does when it believes the editor is
+// already open, and that is the thing to measure.
 //
-// The trace arms itself on the X close and logs the first few calls to every remaining editor slot
-// in the AudioPlugin base. Press the panel button after closing the window and the log names the
-// call that arrives - or shows an empty trace, which says the button reaches nothing at all.
+// The trace arms itself on the X close and logs the first few calls to every
+// remaining editor slot in the AudioPlugin base. Press the panel button after
+// closing the window and the log names the call that arrives - or shows an
+// empty trace, which says the button reaches nothing at all.
 //
-// Each trampoline reports and then tail-jumps to the stock function, so the return value is
-// whatever the stock code produced. That matters here: InitializeEffectEdit returns a pointer and
-// GetPluginType returns something wider than an int, and naming either type wrongly corrupts it.
+// Each trampoline reports and then tail-jumps to the stock function, so the
+// return value is whatever the stock code produced. That matters here:
+// InitializeEffectEdit returns a pointer and GetPluginType returns something
+// wider than an int, and naming either type wrongly corrupts it.
 // ---------------------------------------------------------------------------
 
-#define BRIDGE_TRACE_THUNK(name, original, slot) \
-    ".text\n" \
-    ".globl " name "\n" \
-    ".hidden " name "\n" \
-    ".type " name ", @function\n" \
-    name ":\n" \
-    "  pushq %rbp\n" \
-    "  movq %rsp, %rbp\n" \
-    "  pushq %rdi\n  pushq %rsi\n  pushq %rdx\n" \
-    "  pushq %rcx\n  pushq %r8\n  pushq %r9\n" \
-    "  movq %rdi, %rsi\n" \
-    "  movl $" slot ", %edi\n" \
-    "  call BridgeReportSlot\n" \
-    "  popq %r9\n  popq %r8\n  popq %rcx\n" \
-    "  popq %rdx\n  popq %rsi\n  popq %rdi\n" \
-    "  movq %rbp, %rsp\n" \
-    "  popq %rbp\n" \
-    "  jmp *" original "(%rip)\n" \
-    ".size " name ", .-" name "\n"
+#define BRIDGE_TRACE_THUNK(name, original, slot)                               \
+  ".text\n"                                                                    \
+  ".globl " name "\n"                                                          \
+  ".hidden " name "\n"                                                         \
+  ".type " name ", @function\n" name ":\n"                                     \
+  "  .cfi_startproc\n"                                                         \
+  "  pushq %rbp\n"                                                             \
+  "  .cfi_def_cfa_offset 16\n"                                                 \
+  "  .cfi_offset %rbp, -16\n"                                                  \
+  "  movq %rsp, %rbp\n"                                                        \
+  "  .cfi_def_cfa_register %rbp\n"                                             \
+  "  pushq %rdi\n  pushq %rsi\n  pushq %rdx\n"                                 \
+  "  pushq %rcx\n  pushq %r8\n  pushq %r9\n"                                   \
+  "  movq %rdi, %rsi\n"                                                        \
+  "  movl $" slot ", %edi\n"                                                   \
+  "  call BridgeReportSlot\n"                                                  \
+  "  popq %r9\n  popq %r8\n  popq %rcx\n"                                      \
+  "  popq %rdx\n  popq %rsi\n  popq %rdi\n"                                    \
+  "  movq %rbp, %rsp\n"                                                        \
+  "  popq %rbp\n"                                                              \
+  "  .cfi_def_cfa %rsp, 8\n"                                                   \
+  "  .cfi_restore %rbp\n"                                                      \
+  "  jmp *" original "(%rip)\n"                                                \
+  "  .cfi_endproc\n"                                                           \
+  ".size " name ", .-" name "\n"
 
 extern "C" {
-BRIDGE_HIDDEN2 void BridgeReportSlot(unsigned int slot, void* self);
-BRIDGE_HIDDEN2 void* g_trace_original_16 = nullptr;
+BRIDGE_HIDDEN2 void BridgeReportSlot(unsigned int slot, void *self);
+BRIDGE_HIDDEN2 void *g_trace_original_16 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk16();
-BRIDGE_HIDDEN2 void* g_trace_original_17 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_17 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk17();
-BRIDGE_HIDDEN2 void* g_trace_original_18 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_18 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk18();
-BRIDGE_HIDDEN2 void* g_trace_original_19 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_19 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk19();
-BRIDGE_HIDDEN2 void* g_trace_original_20 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_20 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk20();
-BRIDGE_HIDDEN2 void* g_trace_original_21 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_21 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk21();
-BRIDGE_HIDDEN2 void* g_trace_original_22 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_22 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk22();
-BRIDGE_HIDDEN2 void* g_trace_original_23 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_23 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk23();
-BRIDGE_HIDDEN2 void* g_trace_original_24 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_24 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk24();
-BRIDGE_HIDDEN2 void* g_trace_original_25 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_25 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk25();
-BRIDGE_HIDDEN2 void* g_trace_original_26 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_26 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk26();
-BRIDGE_HIDDEN2 void* g_trace_original_27 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_27 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk27();
-BRIDGE_HIDDEN2 void* g_trace_original_0 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_0 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk0();
-BRIDGE_HIDDEN2 void* g_trace_original_1 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_1 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk1();
-BRIDGE_HIDDEN2 void* g_trace_original_2 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_2 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk2();
-BRIDGE_HIDDEN2 void* g_trace_original_3 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_3 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk3();
-BRIDGE_HIDDEN2 void* g_trace_original_4 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_4 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk4();
-BRIDGE_HIDDEN2 void* g_trace_original_5 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_5 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk5();
-BRIDGE_HIDDEN2 void* g_trace_original_6 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_6 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk6();
-BRIDGE_HIDDEN2 void* g_trace_original_7 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_7 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk7();
-BRIDGE_HIDDEN2 void* g_trace_original_8 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_8 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk8();
-BRIDGE_HIDDEN2 void* g_trace_original_9 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_9 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk9();
-BRIDGE_HIDDEN2 void* g_trace_original_10 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_10 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk10();
-BRIDGE_HIDDEN2 void* g_trace_original_11 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_11 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk11();
-BRIDGE_HIDDEN2 void* g_trace_original_12 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_12 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk12();
-BRIDGE_HIDDEN2 void* g_trace_original_13 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_13 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk13();
-BRIDGE_HIDDEN2 void* g_trace_original_14 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_14 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk14();
-BRIDGE_HIDDEN2 void* g_trace_original_15 = nullptr;
+BRIDGE_HIDDEN2 void *g_trace_original_15 = nullptr;
 BRIDGE_HIDDEN2 void BridgeTraceThunk15();
 }
-
 
 // ---------------------------------------------------------------------------
 // The latency and reset probe.
 //
-// A measurement, not a fix. Every slot below calls the stock implementation and returns exactly
-// what the stock implementation returned. Nothing here changes a value Resolve sees.
+// A measurement, not a fix. Every slot below calls the stock implementation and
+// returns exactly what the stock implementation returned. Nothing here changes
+// a value Resolve sees.
 //
-// It exists because two tester reports point at code this bridge does not have. Stacked effects
-// desync the audio from the video, and the first milliseconds after a locate replay the previous
-// position. Nothing in this bridge reads a hosted plugin's latency, and nothing tells a hosted
-// plugin that the playhead jumped. Resolve has both mechanisms - the question is which of its
-// slots actually reach an effect of ours, and what they carry. See docs/latency-and-reset.md.
+// It exists because two tester reports point at code this bridge does not have.
+// Stacked effects desync the audio from the video, and the first milliseconds
+// after a locate replay the previous position. Nothing in this bridge reads a
+// hosted plugin's latency, and nothing tells a hosted plugin that the playhead
+// jumped. Resolve has both mechanisms - the question is which of its slots
+// actually reach an effect of ours, and what they carry. See
+// docs/latency-and-reset.md.
 //
-// The trace thunk above cannot answer it. That one reports on entry and then tail-jumps, so it
-// never sees a return value, and the return value is the entire question for GetLatency and
-// GetPluginLatency. This one calls the original, keeps the result, reports it, and hands it back
-// untouched.
+// The trace thunk above cannot answer it. That one reports on entry and then
+// tail-jumps, so it never sees a return value, and the return value is the
+// entire question for GetLatency and GetPluginLatency. This one calls the
+// original, keeps the result, reports it, and hands it back untouched.
 //
-// Stack discipline: at entry rsp is 8 past a 16-byte boundary, pushing rbp puts it on one, and
-// the 32 bytes of scratch keep it there, so both calls are correctly aligned.
+// Stack discipline: at entry rsp is 8 past a 16-byte boundary, pushing rbp puts
+// it on one, and the 32 bytes of scratch keep it there, so both calls are
+// correctly aligned.
 // ---------------------------------------------------------------------------
 
-#define BRIDGE_PROBE_THUNK(name, original, index) \
-    ".text\n" \
-    ".globl " name "\n" \
-    ".hidden " name "\n" \
-    ".type " name ", @function\n" \
-    name ":\n" \
-    "  pushq %rbp\n" \
-    "  movq %rsp, %rbp\n" \
-    "  subq $32, %rsp\n" \
-    "  movq %rdi, -8(%rbp)\n" \
-    "  movq %rsi, -16(%rbp)\n" \
-    "  call *" original "(%rip)\n" \
-    "  movq %rax, -24(%rbp)\n" \
-    "  movl $" index ", %edi\n" \
-    "  movq -8(%rbp), %rsi\n" \
-    "  movq -16(%rbp), %rdx\n" \
-    "  movq -24(%rbp), %rcx\n" \
-    "  call BridgeReportProbe\n" \
-    "  movq -24(%rbp), %rax\n" \
-    "  movq %rbp, %rsp\n" \
-    "  popq %rbp\n" \
-    "  ret\n" \
-    ".size " name ", .-" name "\n"
+#define BRIDGE_PROBE_THUNK(name, original, index)                              \
+  ".text\n"                                                                    \
+  ".globl " name "\n"                                                          \
+  ".hidden " name "\n"                                                         \
+  ".type " name ", @function\n" name ":\n"                                     \
+  "  pushq %rbp\n"                                                             \
+  "  movq %rsp, %rbp\n"                                                        \
+  "  subq $32, %rsp\n"                                                         \
+  "  movq %rdi, -8(%rbp)\n"                                                    \
+  "  movq %rsi, -16(%rbp)\n"                                                   \
+  "  call *" original "(%rip)\n"                                               \
+  "  movq %rax, -24(%rbp)\n"                                                   \
+  "  movl $" index ", %edi\n"                                                  \
+  "  movq -8(%rbp), %rsi\n"                                                    \
+  "  movq -16(%rbp), %rdx\n"                                                   \
+  "  movq -24(%rbp), %rcx\n"                                                   \
+  "  call BridgeReportProbe\n"                                                 \
+  "  movq -24(%rbp), %rax\n"                                                   \
+  "  movq %rbp, %rsp\n"                                                        \
+  "  popq %rbp\n"                                                              \
+  "  ret\n"                                                                    \
+  ".size " name ", .-" name "\n"
 
 extern "C" {
-BRIDGE_HIDDEN2 void BridgeReportProbe(unsigned int index, void* self, unsigned long argument,
+BRIDGE_HIDDEN2 void BridgeReportProbe(unsigned int index, void *self,
+                                      unsigned long argument,
                                       unsigned long result);
-BRIDGE_HIDDEN2 void* g_probe_original_0 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_0 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk0();
-BRIDGE_HIDDEN2 void* g_probe_original_1 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_1 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk1();
-BRIDGE_HIDDEN2 void* g_probe_original_2 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_2 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk2();
-BRIDGE_HIDDEN2 void* g_probe_original_3 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_3 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk3();
-BRIDGE_HIDDEN2 void* g_probe_original_4 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_4 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk4();
-BRIDGE_HIDDEN2 void* g_probe_original_5 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_5 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk5();
-BRIDGE_HIDDEN2 void* g_probe_original_6 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_6 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk6();
-BRIDGE_HIDDEN2 void* g_probe_original_7 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_7 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk7();
-BRIDGE_HIDDEN2 void* g_probe_original_8 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_8 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk8();
-BRIDGE_HIDDEN2 void* g_probe_original_9 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_9 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk9();
-BRIDGE_HIDDEN2 void* g_probe_original_10 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_10 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk10();
-BRIDGE_HIDDEN2 void* g_probe_original_11 = nullptr;
+BRIDGE_HIDDEN2 void *g_probe_original_11 = nullptr;
 BRIDGE_HIDDEN2 void BridgeProbeThunk11();
 }
 
@@ -2343,453 +2715,483 @@ asm(BRIDGE_TRACE_THUNK("BridgeTraceThunk27", "g_trace_original_27", "27"));
 namespace {
 
 struct TraceSlot {
-    size_t offset;
-    const char* name;
-    void** original;
-    void* replacement;
-    int reports;
+  size_t offset;
+  const char *name;
+  void **original;
+  void *replacement;
+  int reports = 0;
 };
 
 TraceSlot g_trace_slots[] = {
-    { 0x7a8, "CanResize", &g_trace_original_0, reinterpret_cast<void*>(&BridgeTraceThunk0) },
-    { 0x7c0, "UpdateEffectEditTitle", &g_trace_original_1, reinterpret_cast<void*>(&BridgeTraceThunk1) },
-    { 0x7c8, "GetEffectEditTitle", &g_trace_original_2, reinterpret_cast<void*>(&BridgeTraceThunk2) },
-    { 0x7d8, "OnEditorIdle", &g_trace_original_3, reinterpret_cast<void*>(&BridgeTraceThunk3) },
-    { 0x7e0, "EditorTop", &g_trace_original_4, reinterpret_cast<void*>(&BridgeTraceThunk4) },
-    { 0x7e8, "EditorPreInitialize", &g_trace_original_5, reinterpret_cast<void*>(&BridgeTraceThunk5) },
-    { 0x7f0, "EditorIdleRefresh", &g_trace_original_6, reinterpret_cast<void*>(&BridgeTraceThunk6) },
-    { 0x7f8, "EditorMute", &g_trace_original_7, reinterpret_cast<void*>(&BridgeTraceThunk7) },
-    { 0x830, "HideSubWindows", &g_trace_original_8, reinterpret_cast<void*>(&BridgeTraceThunk8) },
-    { 0x858, "LockEditor", &g_trace_original_9, reinterpret_cast<void*>(&BridgeTraceThunk9) },
-    { 0x8c8, "GetEffectRect", &g_trace_original_10, reinterpret_cast<void*>(&BridgeTraceThunk10) },
-    { 0x8d0, "UpdateEffectRect", &g_trace_original_11, reinterpret_cast<void*>(&BridgeTraceThunk11) },
-    { 0x8d8, "CheckEffectRect", &g_trace_original_12, reinterpret_cast<void*>(&BridgeTraceThunk12) },
-    { 0x8e0, "UpdateDPI", &g_trace_original_13, reinterpret_cast<void*>(&BridgeTraceThunk13) },
-    { 0x288, "Update", &g_trace_original_14, reinterpret_cast<void*>(&BridgeTraceThunk14) },
-    { 0x838, "UpdateInspector", &g_trace_original_15, reinterpret_cast<void*>(&BridgeTraceThunk15) },
-    { 0x460, "GenerateUserInterface", &g_trace_original_16, reinterpret_cast<void*>(&BridgeTraceThunk16) },
-    { 0x470, "GetResourcePath", &g_trace_original_17, reinterpret_cast<void*>(&BridgeTraceThunk17) },
-    { 0x468, "UpdateParameterList", &g_trace_original_18, reinterpret_cast<void*>(&BridgeTraceThunk18) },
-    { 0x350, "GetParameterList", &g_trace_original_19, reinterpret_cast<void*>(&BridgeTraceThunk19) },
-    { 0x358, "GetDisplayGroups", &g_trace_original_20, reinterpret_cast<void*>(&BridgeTraceThunk20) },
-    { 0x2c8, "GetNumberOfParameters", &g_trace_original_21, reinterpret_cast<void*>(&BridgeTraceThunk21) },
-    { 0x2d0, "GetParameterName", &g_trace_original_22, reinterpret_cast<void*>(&BridgeTraceThunk22) },
-    { 0x2d8, "GetControlType", &g_trace_original_23, reinterpret_cast<void*>(&BridgeTraceThunk23) },
+    {0x7a8, "CanResize", &g_trace_original_0,
+     reinterpret_cast<void *>(&BridgeTraceThunk0)},
+    {0x7c0, "UpdateEffectEditTitle", &g_trace_original_1,
+     reinterpret_cast<void *>(&BridgeTraceThunk1)},
+    {0x7c8, "GetEffectEditTitle", &g_trace_original_2,
+     reinterpret_cast<void *>(&BridgeTraceThunk2)},
+    {0x7d8, "OnEditorIdle", &g_trace_original_3,
+     reinterpret_cast<void *>(&BridgeTraceThunk3)},
+    {0x7e0, "EditorTop", &g_trace_original_4,
+     reinterpret_cast<void *>(&BridgeTraceThunk4)},
+    {0x7e8, "EditorPreInitialize", &g_trace_original_5,
+     reinterpret_cast<void *>(&BridgeTraceThunk5)},
+    {0x7f0, "EditorIdleRefresh", &g_trace_original_6,
+     reinterpret_cast<void *>(&BridgeTraceThunk6)},
+    {0x7f8, "EditorMute", &g_trace_original_7,
+     reinterpret_cast<void *>(&BridgeTraceThunk7)},
+    {0x830, "HideSubWindows", &g_trace_original_8,
+     reinterpret_cast<void *>(&BridgeTraceThunk8)},
+    {0x858, "LockEditor", &g_trace_original_9,
+     reinterpret_cast<void *>(&BridgeTraceThunk9)},
+    {0x8c8, "GetEffectRect", &g_trace_original_10,
+     reinterpret_cast<void *>(&BridgeTraceThunk10)},
+    {0x8d0, "UpdateEffectRect", &g_trace_original_11,
+     reinterpret_cast<void *>(&BridgeTraceThunk11)},
+    {0x8d8, "CheckEffectRect", &g_trace_original_12,
+     reinterpret_cast<void *>(&BridgeTraceThunk12)},
+    {0x8e0, "UpdateDPI", &g_trace_original_13,
+     reinterpret_cast<void *>(&BridgeTraceThunk13)},
+    {0x288, "Update", &g_trace_original_14,
+     reinterpret_cast<void *>(&BridgeTraceThunk14)},
+    {0x838, "UpdateInspector", &g_trace_original_15,
+     reinterpret_cast<void *>(&BridgeTraceThunk15)},
+    {0x460, "GenerateUserInterface", &g_trace_original_16,
+     reinterpret_cast<void *>(&BridgeTraceThunk16)},
+    {0x470, "GetResourcePath", &g_trace_original_17,
+     reinterpret_cast<void *>(&BridgeTraceThunk17)},
+    {0x468, "UpdateParameterList", &g_trace_original_18,
+     reinterpret_cast<void *>(&BridgeTraceThunk18)},
+    {0x350, "GetParameterList", &g_trace_original_19,
+     reinterpret_cast<void *>(&BridgeTraceThunk19)},
+    {0x358, "GetDisplayGroups", &g_trace_original_20,
+     reinterpret_cast<void *>(&BridgeTraceThunk20)},
+    {0x2c8, "GetNumberOfParameters", &g_trace_original_21,
+     reinterpret_cast<void *>(&BridgeTraceThunk21)},
+    {0x2d0, "GetParameterName", &g_trace_original_22,
+     reinterpret_cast<void *>(&BridgeTraceThunk22)},
+    {0x2d8, "GetControlType", &g_trace_original_23,
+     reinterpret_cast<void *>(&BridgeTraceThunk23)},
     // The two that decide whether settings can be saved at all.
     //
-    // AudioPluginPreset is the object Resolve carries an effect in: AudioPluginHost::
-    // AddPlaceholderPlugin takes one when it restores a plugin that is not loaded yet. If
-    // these fire on project save and project open, the preset is the channel a hosted
-    // plugin's state can travel through, and SaveState/LoadState have somewhere to go. If
-    // they only fire when a user picks a preset from the menu, they are not, and the state
-    // needs its own store. Nothing here answers that question - the log does, once.
-    { 0x380, "StorePreset", &g_trace_original_24, reinterpret_cast<void*>(&BridgeTraceThunk24) },
-    { 0x388, "LoadPreset", &g_trace_original_25, reinterpret_cast<void*>(&BridgeTraceThunk25) },
-    // How Resolve most likely saves an effect: by reading its parameters, one at a time,
-    // rather than by asking it for a blob. If a burst of these lands on a project save, the
-    // parameter list is the channel, and the settings belong in the project rather than in
-    // a file on a timer.
-    { 0x318, "GetParameterValue", &g_trace_original_26, reinterpret_cast<void*>(&BridgeTraceThunk26) },
-    { 0x340, "SetParameterValueFromText", &g_trace_original_27, reinterpret_cast<void*>(&BridgeTraceThunk27) },
+    // AudioPluginPreset is the object Resolve carries an effect in:
+    // AudioPluginHost:: AddPlaceholderPlugin takes one when it restores a
+    // plugin that is not loaded yet. If these fire on project save and project
+    // open, the preset is the channel a hosted plugin's state can travel
+    // through, and SaveState/LoadState have somewhere to go. If they only fire
+    // when a user picks a preset from the menu, they are not, and the state
+    // needs its own store. Nothing here answers that question - the log does,
+    // once.
+    {0x380, "StorePreset", &g_trace_original_24,
+     reinterpret_cast<void *>(&BridgeTraceThunk24)},
+    {0x388, "LoadPreset", &g_trace_original_25,
+     reinterpret_cast<void *>(&BridgeTraceThunk25)},
+    // How Resolve most likely saves an effect: by reading its parameters, one
+    // at a time, rather than by asking it for a blob. If a burst of these lands
+    // on a project save, the parameter list is the channel, and the settings
+    // belong in the project rather than in a file on a timer.
+    {0x318, "GetParameterValue", &g_trace_original_26,
+     reinterpret_cast<void *>(&BridgeTraceThunk26)},
+    {0x340, "SetParameterValueFromText", &g_trace_original_27,
+     reinterpret_cast<void *>(&BridgeTraceThunk27)},
 };
 
 // The probe table. Offsets are read off BMDStereoDelay's own vtable with
-// `tools/resolve-map/rmap vtable BMDStereoDelay`, never off another class: +0x120 carries
-// AudioPlugin::GetLatency on ADMRenderer and BMDAudioPluginImpl::DragDropEvent here, and probing
-// it would have replaced drag-and-drop on a build handed to a tester.
+// `tools/resolve-map/rmap vtable BMDStereoDelay`, never off another class:
+// +0x120 carries AudioPlugin::GetLatency on ADMRenderer and
+// BMDAudioPluginImpl::DragDropEvent here, and probing it would have replaced
+// drag-and-drop on a build handed to a tester.
 //
-// Both the primary slot and its non-virtual thunk are probed, because which of the two Resolve
-// calls is part of what is being measured.
+// Both the primary slot and its non-virtual thunk are probed, because which of
+// the two Resolve calls is part of what is being measured.
 struct ProbeSlot {
-    size_t offset;
-    const char* name;
-    bool returns_value;
-    // A latency slot is never silenced by the change filter, because the first probe could not
-    // tell "not called again" from "called again with the same answer" - and the answer was zero
-    // every time. The call count decides whether answering this slot honestly is enough, so it is
-    // counted on every call and printed on every line.
-    bool is_latency;
-    // Whether to ask the hosted plugin its latency for this line. Separate from is_latency, which
-    // only decides how loudly a slot reports: asking the plugin means calling into it, and a slot
-    // that fires often or off the main thread is the wrong place to do that for a log line.
-    bool ask_plugin;
-    void** original;
-    void* replacement;
-    int reports;
-    long calls;
-    unsigned long last_argument;
-    unsigned long last_result;
-    bool seen;
+  size_t offset;
+  const char *name;
+  bool returns_value;
+  // A latency slot is never silenced by the change filter, because the first
+  // probe could not tell "not called again" from "called again with the same
+  // answer" - and the answer was zero every time. The call count decides
+  // whether answering this slot honestly is enough, so it is counted on every
+  // call and printed on every line.
+  bool is_latency;
+  // Whether to ask the hosted plugin its latency for this line. Separate from
+  // is_latency, which only decides how loudly a slot reports: asking the plugin
+  // means calling into it, and a slot that fires often or off the main thread
+  // is the wrong place to do that for a log line.
+  bool ask_plugin;
+  void **original;
+  void *replacement;
+  int reports = 0;
+  long calls = 0;
+  unsigned long last_argument = 0;
+  unsigned long last_result = 0;
+  bool seen = false;
 };
 
 ProbeSlot g_probe_slots[] = {
-    // What consumers read. DelayCompensation::CalculateEffectDelay and BMDChainFX::UpdateLatency
-    // both end up here, and the stock body is `mov 0x160(%rdi),%eax` - a cached int32.
-    { 0x200, "GetLatency", true, true, true, &g_probe_original_0,
-      reinterpret_cast<void*>(&BridgeProbeThunk0) },
-    { 0x760, "GetLatency (thunk)", true, true, true, &g_probe_original_1,
-      reinterpret_cast<void*>(&BridgeProbeThunk1) },
-    // What asks the plugin what its latency IS. The only caller found in libBMDAudioPlugins.so is
-    // BMDChainFX::OnIdle, so whether this fires at all says whether our effect sits in a chain.
-    { 0x478, "GetPluginLatency", true, true, true, &g_probe_original_2,
-      reinterpret_cast<void*>(&BridgeProbeThunk2) },
-    // The only thing that writes the cache at this+0x160, under a recursive mutex.
-    { 0x490, "LatencyChanged", false, true, false, &g_probe_original_3,
-      reinterpret_cast<void*>(&BridgeProbeThunk3) },
-    // The locate. If these fire when the playhead jumps, the stale-audio report has a seam.
-    { 0x1c0, "ResetHistory", false, false, false, &g_probe_original_4,
-      reinterpret_cast<void*>(&BridgeProbeThunk4) },
-    { 0x6a0, "ResetHistory (thunk)", false, false, false, &g_probe_original_5,
-      reinterpret_cast<void*>(&BridgeProbeThunk5) },
-    { 0x1c8, "RequiresHistoryReset", true, false, false, &g_probe_original_6,
-      reinterpret_cast<void*>(&BridgeProbeThunk6) },
-    { 0xa00, "RequiresHistoryReset (thunk)", true, false, false, &g_probe_original_7,
-      reinterpret_cast<void*>(&BridgeProbeThunk7) },
-    // Found while checking the others, and not in the written-up analysis: Resolve asks whether a
+    // What consumers read. DelayCompensation::CalculateEffectDelay and
+    // BMDChainFX::UpdateLatency
+    // both end up here, and the stock body is `mov 0x160(%rdi),%eax` - a cached
+    // int32.
+    {0x200, "GetLatency", true, true, true, &g_probe_original_0,
+     reinterpret_cast<void *>(&BridgeProbeThunk0)},
+    {0x760, "GetLatency (thunk)", true, true, true, &g_probe_original_1,
+     reinterpret_cast<void *>(&BridgeProbeThunk1)},
+    // What asks the plugin what its latency IS. The only caller found in
+    // libBMDAudioPlugins.so is
+    // BMDChainFX::OnIdle, so whether this fires at all says whether our effect
+    // sits in a chain.
+    {0x478, "GetPluginLatency", true, true, true, &g_probe_original_2,
+     reinterpret_cast<void *>(&BridgeProbeThunk2)},
+    // The only thing that writes the cache at this+0x160, under a recursive
+    // mutex.
+    {0x490, "LatencyChanged", false, true, false, &g_probe_original_3,
+     reinterpret_cast<void *>(&BridgeProbeThunk3)},
+    // The locate. If these fire when the playhead jumps, the stale-audio report
+    // has a seam.
+    {0x1c0, "ResetHistory", false, false, false, &g_probe_original_4,
+     reinterpret_cast<void *>(&BridgeProbeThunk4)},
+    {0x6a0, "ResetHistory (thunk)", false, false, false, &g_probe_original_5,
+     reinterpret_cast<void *>(&BridgeProbeThunk5)},
+    {0x1c8, "RequiresHistoryReset", true, false, false, &g_probe_original_6,
+     reinterpret_cast<void *>(&BridgeProbeThunk6)},
+    {0xa00, "RequiresHistoryReset (thunk)", true, false, false,
+     &g_probe_original_7, reinterpret_cast<void *>(&BridgeProbeThunk7)},
+    // Found while checking the others, and not in the written-up analysis:
+    // Resolve asks whether a
     // plugin can reset itself.
-    { 0x800, "CanResetInternally", true, false, false, &g_probe_original_8,
-      reinterpret_cast<void*>(&BridgeProbeThunk8) },
-    // The gap at play start survives with our reset switched off, so it is not the reset. These
-    // three are the remaining candidates for how Resolve primes a latent effect, and none of them
+    {0x800, "CanResetInternally", true, false, false, &g_probe_original_8,
+     reinterpret_cast<void *>(&BridgeProbeThunk8)},
+    // The gap at play start survives with our reset switched off, so it is not
+    // the reset. These
+    // three are the remaining candidates for how Resolve primes a latent
+    // effect, and none of them
     // has been seen to fire on ours.
     //
-    // GetPluginFlags reads the DSP object at +0x30, immediately after the latency at +0x28. If one
-    // of those bits says "this effect has latency, run it ahead", our effect answers with whatever
+    // GetPluginFlags reads the DSP object at +0x30, immediately after the
+    // latency at +0x28. If one
+    // of those bits says "this effect has latency, run it ahead", our effect
+    // answers with whatever
     // the stock Delay puts there - a plugin that has none.
-    { 0x480, "GetPluginFlags", true, true, false, &g_probe_original_9,
-      reinterpret_cast<void*>(&BridgeProbeThunk9) },
-    // A host telling a plugin to chew through samples outside playback. That is what priming is.
-    { 0x208, "SetOfflineSamplesToProcess", false, true, false, &g_probe_original_10,
-      reinterpret_cast<void*>(&BridgeProbeThunk10) },
-    { 0x770, "SetOfflineSamplesToProcess (thunk)", false, true, false, &g_probe_original_11,
-      reinterpret_cast<void*>(&BridgeProbeThunk11) },
+    {0x480, "GetPluginFlags", true, true, false, &g_probe_original_9,
+     reinterpret_cast<void *>(&BridgeProbeThunk9)},
+    // A host telling a plugin to chew through samples outside playback. That is
+    // what priming is.
+    {0x208, "SetOfflineSamplesToProcess", false, true, false,
+     &g_probe_original_10, reinterpret_cast<void *>(&BridgeProbeThunk10)},
+    {0x770, "SetOfflineSamplesToProcess (thunk)", false, true, false,
+     &g_probe_original_11, reinterpret_cast<void *>(&BridgeProbeThunk11)},
 };
 
 // The first calls always, and after that only when something changed.
 //
-// GetLatency can be asked once per block. A flat cap would answer "does it fire" and then go
-// quiet before the interesting moment - a plugin being added, or a locate. A change filter keeps
-// the log readable for an hour of editing and still catches every transition.
+// GetLatency can be asked once per block. A flat cap would answer "does it
+// fire" and then go quiet before the interesting moment - a plugin being added,
+// or a locate. A change filter keeps the log readable for an hour of editing
+// and still catches every transition.
 constexpr int kProbeAlways = 12;
 constexpr int kProbeCap = 400;
 
 constexpr int kTraceCap = 6;
 
-// The two slots the panel button really drives.
-constexpr size_t kUpdateEffectEditTitleOffset = 0x7c0;
-constexpr size_t kHideSubWindowsOffset = 0x830;
-
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Latency, and the locate.
 //
-// Measured before it was written, on a tester's machine over two probe builds. Resolve asks each
-// effect for its latency exactly once, at project load, through GetPluginLatency at +0x478 - after
-// the hosted plugin is loaded and while it is answering with a real number. It was told zero every
-// time. Nine instances reporting 0, 0, 0, 0, 720, 768, 1024, 1080, 2048 and 6144 samples, and
-// Resolve compensating for none of it. That is the audio drifting out of sync with the video.
+// Measured before it was written, on a tester's machine over two probe builds.
+// Resolve asks each effect for its latency exactly once, at project load,
+// through GetPluginLatency at +0x478 - after the hosted plugin is loaded and
+// while it is answering with a real number. It was told zero every time. Nine
+// instances reporting 0, 0, 0, 0, 720, 768, 1024, 1080, 2048 and 6144 samples,
+// and Resolve compensating for none of it. That is the audio drifting out of
+// sync with the video.
 //
-// Only the answer is ours. The poll, the cache at this+0x160, the mutex, LatencyChanged and
-// DelayCompensation all stay Resolve's own code doing its own job - the measurement showed that
-// machinery running correctly on an input of zero. Full account in docs/latency-and-reset.md.
+// Only the answer is ours. The poll, the cache at this+0x160, the mutex,
+// LatencyChanged and DelayCompensation all stay Resolve's own code doing its
+// own job - the measurement showed that machinery running correctly on an input
+// of zero. Full account in docs/latency-and-reset.md.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-using GetPluginLatencyFn = long long (*)(void*);
-using ResetHistoryFn = void (*)(void*, bool);
+using GetPluginLatencyFn = long long (*)(void *);
+using ResetHistoryFn = void (*)(void *, bool);
 
-void* g_original_get_plugin_latency = nullptr;
-void* g_original_reset_history = nullptr;
-void* g_original_reset_history_thunk = nullptr;
+void *g_original_get_plugin_latency = nullptr;
+void *g_original_reset_history = nullptr;
+void *g_original_reset_history_thunk = nullptr;
 
-// A thunk hands over `this` adjusted by 0x20, and Resolve calls the thunks: every GetLatency line
-// in the probe sat exactly 0x20 above its paired GetPluginLatency line.
-ClaimedEffect* EffectBehindSlot(void* self)
-{
-    ClaimedEffect* const found = FindEffectAny(self);
-    if (found != nullptr) {
-        return found;
-    }
-    return FindEffectAny(static_cast<void*>(static_cast<char*>(self) - 0x20));
+// A thunk hands over `this` adjusted by 0x20, and Resolve calls the thunks:
+// every GetLatency line in the probe sat exactly 0x20 above its paired
+// GetPluginLatency line.
+ClaimedEffect *EffectBehindSlot(void *self) {
+  ClaimedEffect *const found = FindEffectAny(self);
+  if (found != nullptr) {
+    return found;
+  }
+  return FindEffectAny(static_cast<void *>(static_cast<char *>(self) - 0x20));
 }
 
-long long BridgeGetPluginLatency(void* self)
-{
-    ClaimedEffect* const effect = EffectBehindSlot(self);
-    if (effect != nullptr && effect->plugin != nullptr) {
-        const long long samples = effect->plugin->LatencySamples();
-        // A format that cannot answer returns -1, and -1 is not a latency. Falling through to the
-        // stock body is right there: it answers zero, which is what a plugin that reports nothing
-        // is asking to be treated as.
-        if (samples >= 0) {
-            if (effect->reported_latency != samples) {
-                effect->reported_latency = samples;
-                Log("latency: \"%s\" reports %lld samples", effect->plugin->Name(), samples);
-            }
-            return samples;
-        }
+long long BridgeGetPluginLatency(void *self) {
+  ClaimedEffect *const effect = EffectBehindSlot(self);
+  if (effect != nullptr && effect->plugin != nullptr) {
+    const long long samples = effect->plugin->LatencySamples();
+    // A format that cannot answer returns -1, and -1 is not a latency. Falling
+    // through to the stock body is right there: it answers zero, which is what
+    // a plugin that reports nothing is asking to be treated as.
+    if (samples >= 0) {
+      if (effect->reported_latency != samples) {
+        effect->reported_latency = samples;
+        Log("latency: \"%s\" reports %lld samples", effect->plugin->Name(),
+            samples);
+      }
+      return samples;
     }
-    if (g_original_get_plugin_latency != nullptr) {
-        return reinterpret_cast<GetPluginLatencyFn>(g_original_get_plugin_latency)(self);
-    }
-    return 0;
+  }
+  if (g_original_get_plugin_latency != nullptr) {
+    return reinterpret_cast<GetPluginLatencyFn>(g_original_get_plugin_latency)(
+        self);
+  }
+  return 0;
 }
 
-void BridgeResetHistoryCommon(void* self, bool flag, void* original)
-{
-    if (original != nullptr) {
-        reinterpret_cast<ResetHistoryFn>(original)(self, flag);
-    }
-    ClaimedEffect* const effect = EffectBehindSlot(self);
-    if (effect != nullptr) {
-        effect->reset_pending.store(true, std::memory_order_release);
-    }
+void BridgeResetHistoryCommon(void *self, bool flag, void *original) {
+  if (original != nullptr) {
+    reinterpret_cast<ResetHistoryFn>(original)(self, flag);
+  }
+  ClaimedEffect *const effect = EffectBehindSlot(self);
+  if (effect != nullptr) {
+    effect->reset_pending.store(true, std::memory_order_release);
+  }
 }
 
-void BridgeResetHistory(void* self, bool flag)
-{
-    BridgeResetHistoryCommon(self, flag, g_original_reset_history);
+void BridgeResetHistory(void *self, bool flag) {
+  BridgeResetHistoryCommon(self, flag, g_original_reset_history);
 }
 
-void BridgeResetHistoryThunk(void* self, bool flag)
-{
-    BridgeResetHistoryCommon(self, flag, g_original_reset_history_thunk);
+void BridgeResetHistoryThunk(void *self, bool flag) {
+  BridgeResetHistoryCommon(self, flag, g_original_reset_history_thunk);
 }
 
 constexpr size_t kGetPluginLatencyOffset = 0x478;
 constexpr size_t kResetHistoryOffset = 0x1c0;
 constexpr size_t kResetHistoryThunkOffset = 0x6a0;
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // The name in the effect list.
 //
-// The effect rides on BMDStereoDelay, so Resolve labels it "Delay". Three calls can carry the
-// label and they do not agree on a string type, so each replacement reads what the stock call
-// returned and answers in the same encoding. wchar_t is four bytes here, so an ASCII wide string
-// reads as c,0,0,0 and an ASCII narrow one as c,x - that is enough to tell them apart.
+// The effect rides on BMDStereoDelay, so Resolve labels it "Delay". Three calls
+// can carry the label and they do not agree on a string type, so each
+// replacement reads what the stock call returned and answers in the same
+// encoding. wchar_t is four bytes here, so an ASCII wide string reads as
+// c,0,0,0 and an ASCII narrow one as c,x - that is enough to tell them apart.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-// Returns true when the bytes look like a wide string. Reads through SafeRead, so a bad pointer
-// costs a false instead of a fault.
-bool LooksWide(const void* text)
-{
-    unsigned char bytes[4] = {0, 0, 0, 0};
-    if (text == nullptr || !SafeRead(text, bytes, sizeof(bytes))) {
-        return false;
-    }
-    return bytes[0] != 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
+// Returns true when the bytes look like a wide string. Reads through SafeRead,
+// so a bad pointer costs a false instead of a fault.
+bool LooksWide(const void *text) {
+  unsigned char bytes[4] = {0, 0, 0, 0};
+  if (text == nullptr || !SafeRead(text, bytes, sizeof(bytes))) {
+    return false;
+  }
+  return bytes[0] != 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
 }
 
-void LogStockLabel(const char* call, const void* text)
-{
-    if (text == nullptr) {
-        Log("label: %s returned nullptr", call);
-    } else if (LooksWide(text)) {
-        Log("label: %s returned a wide string at %p", call, text);
-    } else {
-        char narrow[64] = {0};
-        SafeRead(text, narrow, sizeof(narrow) - 1);
-        Log("label: %s returned a narrow string \"%s\"", call, narrow);
-    }
+void LogStockLabel(const char *call, const void *text) {
+  if (text == nullptr) {
+    Log("label: %s returned nullptr", call);
+  } else if (LooksWide(text)) {
+    Log("label: %s returned a wide string at %p", call, text);
+  } else {
+    char narrow[64] = {0};
+    SafeRead(text, narrow, sizeof(narrow) - 1);
+    Log("label: %s returned a narrow string \"%s\"", call, narrow);
+  }
 }
 
 int g_label_reports = 0;
 
-}  // namespace
+} // namespace
 
 extern "C" {
-BRIDGE_HIDDEN2 void* g_original_effect_name = nullptr;
-BRIDGE_HIDDEN2 void* g_original_effect_name_thunk = nullptr;
-BRIDGE_HIDDEN2 void* g_original_user_effect_name = nullptr;
+BRIDGE_HIDDEN2 void *g_original_effect_name = nullptr;
+BRIDGE_HIDDEN2 void *g_original_effect_name_thunk = nullptr;
+BRIDGE_HIDDEN2 void *g_original_user_effect_name = nullptr;
 }
 
-extern "C" const void* BridgeEffectName(void* self)
-{
-    const void* stock = nullptr;
-    if (g_original_effect_name != nullptr) {
-        stock = reinterpret_cast<const void* (*)(void*)>(g_original_effect_name)(self);
-    }
-    if (++g_label_reports <= 6) {
-        LogStockLabel("GetEffectName", stock);
-    }
-    const ClaimedEffect* const effect = FindEffect(self);
-    if (effect == nullptr || effect->label_narrow[0] == '\0') {
-        return stock;  // not one of ours: a stock Delay keeps its own name
-    }
-    return LooksWide(stock) ? static_cast<const void*>(effect->label_wide)
-                            : static_cast<const void*>(effect->label_narrow);
+extern "C" const void *BridgeEffectName(void *self) {
+  const void *stock = nullptr;
+  if (g_original_effect_name != nullptr) {
+    stock =
+        reinterpret_cast<const void *(*)(void *)>(g_original_effect_name)(self);
+  }
+  if (++g_label_reports <= 6) {
+    LogStockLabel("GetEffectName", stock);
+  }
+  const ClaimedEffect *const effect = FindEffect(self);
+  if (effect == nullptr || effect->label_narrow[0] == '\0') {
+    return stock; // not one of ours: a stock Delay keeps its own name
+  }
+  return LooksWide(stock) ? static_cast<const void *>(effect->label_wide)
+                          : static_cast<const void *>(effect->label_narrow);
 }
 
-extern "C" const void* BridgeEffectNameThunk(void* self)
-{
-    const void* stock = nullptr;
-    if (g_original_effect_name_thunk != nullptr) {
-        stock = reinterpret_cast<const void* (*)(void*)>(g_original_effect_name_thunk)(self);
-    }
-    if (++g_label_reports <= 6) {
-        LogStockLabel("AudioPlugin::GetEffectName", stock);
-    }
-    const ClaimedEffect* const effect = FindEffect(self);
-    if (effect == nullptr || effect->label_narrow[0] == '\0') {
-        return stock;
-    }
-    return LooksWide(stock) ? static_cast<const void*>(effect->label_wide)
-                            : static_cast<const void*>(effect->label_narrow);
+extern "C" const void *BridgeEffectNameThunk(void *self) {
+  const void *stock = nullptr;
+  if (g_original_effect_name_thunk != nullptr) {
+    stock = reinterpret_cast<const void *(*)(void *)>(
+        g_original_effect_name_thunk)(self);
+  }
+  if (++g_label_reports <= 6) {
+    LogStockLabel("AudioPlugin::GetEffectName", stock);
+  }
+  const ClaimedEffect *const effect = FindEffect(self);
+  if (effect == nullptr || effect->label_narrow[0] == '\0') {
+    return stock;
+  }
+  return LooksWide(stock) ? static_cast<const void *>(effect->label_wide)
+                          : static_cast<const void *>(effect->label_narrow);
 }
 
-// SetUserEffectName takes a wchar_t const*, so this one is wide by declaration. It answers nullptr
-// until the user renames the effect, and nullptr is the case we want to fill.
-extern "C" const wchar_t* BridgeUserEffectName(void* self)
-{
-    const wchar_t* stock = nullptr;
-    if (g_original_user_effect_name != nullptr) {
-        stock = reinterpret_cast<const wchar_t* (*)(void*)>(g_original_user_effect_name)(self);
-    }
-    if (++g_label_reports <= 6) {
-        LogStockLabel("GetUserEffectName", stock);
-    }
-    const ClaimedEffect* const effect = FindEffect(self);
-    if (stock != nullptr || effect == nullptr || effect->label_wide[0] == 0) {
-        return stock;
-    }
-    return effect->label_wide;
+// SetUserEffectName takes a wchar_t const*, so this one is wide by declaration.
+// It answers nullptr until the user renames the effect, and nullptr is the case
+// we want to fill.
+extern "C" const wchar_t *BridgeUserEffectName(void *self) {
+  const wchar_t *stock = nullptr;
+  if (g_original_user_effect_name != nullptr) {
+    stock = reinterpret_cast<const wchar_t *(*)(void *)>(
+        g_original_user_effect_name)(self);
+  }
+  if (++g_label_reports <= 6) {
+    LogStockLabel("GetUserEffectName", stock);
+  }
+  const ClaimedEffect *const effect = FindEffect(self);
+  if (stock != nullptr || effect == nullptr || effect->label_wide[0] == 0) {
+    return stock;
+  }
+  return effect->label_wide;
 }
 
-extern "C" void BridgeReportProbe(unsigned int index, void* self, unsigned long argument,
-                                 unsigned long result)
-{
-    if (index >= sizeof(g_probe_slots) / sizeof(g_probe_slots[0])) {
-        return;
-    }
-    ProbeSlot& entry = g_probe_slots[index];
-    ++entry.calls;
-    if (entry.reports >= kProbeCap) {
-        return;
-    }
-    const bool changed = !entry.seen || entry.last_argument != argument ||
-                         (entry.returns_value && entry.last_result != result);
-    // A latency slot reports on a schedule as well as on a change, so the log carries how often it
-    // is really asked. Everything else stays quiet once it has nothing new to say.
-    const bool scheduled = entry.is_latency && (entry.calls % 50) == 0;
-    if (entry.reports >= kProbeAlways && !changed && !scheduled) {
-        return;
-    }
-    entry.seen = true;
-    entry.last_argument = argument;
-    entry.last_result = result;
-    ++entry.reports;
+extern "C" void BridgeReportProbe(unsigned int index, void *self,
+                                  unsigned long argument,
+                                  unsigned long result) {
+  if (index >= sizeof(g_probe_slots) / sizeof(g_probe_slots[0])) {
+    return;
+  }
+  ProbeSlot &entry = g_probe_slots[index];
+  ++entry.calls;
+  if (entry.reports >= kProbeCap) {
+    return;
+  }
+  const bool changed = !entry.seen || entry.last_argument != argument ||
+                       (entry.returns_value && entry.last_result != result);
+  // A latency slot reports on a schedule as well as on a change, so the log
+  // carries how often it is really asked. Everything else stays quiet once it
+  // has nothing new to say.
+  const bool scheduled = entry.is_latency && (entry.calls % 50) == 0;
+  if (entry.reports >= kProbeAlways && !changed && !scheduled) {
+    return;
+  }
+  entry.seen = true;
+  entry.last_argument = argument;
+  entry.last_result = result;
+  ++entry.reports;
 
-    // What the hosted plugin says about itself, next to what Resolve was told.
-    //
-    // The two numbers on one line is the whole point. Resolve reads zero; if the plugin reports
-    // something else at the same moment, the gap between them is the bug, and the timing says
-    // whether the number is even known by the time Resolve asks.
-    //
-    // Only on a latency slot, and that restriction is deliberate. LatencySamples() calls into the
-    // plugin, and a VST3 wants get_latency_samples on the main thread. The latency slots were
-    // measured arriving at project load; RequiresHistoryReset fired four hundred times in one
-    // session and may well be on the audio thread. Asking a plugin a question from there to
-    // satisfy a log line is not a trade worth making.
-    char hosted[64] = "";
-    if (entry.ask_plugin) {
-        // FindEffectAny also matches primary_base, which is what a thunk's adjusted `this`
-        // resolves to. The explicit -0x20 is the fallback: measured on the first probe, every
-        // GetLatency line sat exactly 0x20 above its paired GetPluginLatency line.
-        ClaimedEffect* found = FindEffectAny(self);
-        if (found == nullptr) {
-            found = FindEffectAny(static_cast<void*>(static_cast<char*>(self) - 0x20));
-        }
-        if (found != nullptr && found->plugin != nullptr) {
-            const long long samples = found->plugin->LatencySamples();
-            if (samples >= 0) {
-                std::snprintf(hosted, sizeof(hosted), "  plugin says %lld", samples);
-            } else {
-                std::snprintf(hosted, sizeof(hosted), "  plugin does not answer");
-            }
-        } else {
-            std::snprintf(hosted, sizeof(hosted), "  no effect of ours at this pointer");
-        }
+  // What the hosted plugin says about itself, next to what Resolve was told.
+  //
+  // The two numbers on one line is the whole point. Resolve reads zero; if the
+  // plugin reports something else at the same moment, the gap between them is
+  // the bug, and the timing says whether the number is even known by the time
+  // Resolve asks.
+  //
+  // Only on a latency slot, and that restriction is deliberate.
+  // LatencySamples() calls into the plugin, and a VST3 wants
+  // get_latency_samples on the main thread. The latency slots were measured
+  // arriving at project load; RequiresHistoryReset fired four hundred times in
+  // one session and may well be on the audio thread. Asking a plugin a question
+  // from there to satisfy a log line is not a trade worth making.
+  char hosted[64] = "";
+  if (entry.ask_plugin) {
+    // FindEffectAny also matches primary_base, which is what a thunk's adjusted
+    // `this` resolves to. The explicit -0x20 is the fallback: measured on the
+    // first probe, every GetLatency line sat exactly 0x20 above its paired
+    // GetPluginLatency line.
+    ClaimedEffect *found = FindEffectAny(self);
+    if (found == nullptr) {
+      found =
+          FindEffectAny(static_cast<void *>(static_cast<char *>(self) - 0x20));
     }
-
-    if (entry.returns_value) {
-        Log("probe: %s (+0x%03zx) call %ld this=%p arg=%#lx -> %lu%s", entry.name, entry.offset,
-            entry.calls, self, argument, result, hosted);
+    if (found != nullptr && found->plugin != nullptr) {
+      const long long samples = found->plugin->LatencySamples();
+      if (samples >= 0) {
+        std::snprintf(hosted, sizeof(hosted), "  plugin says %lld", samples);
+      } else {
+        std::snprintf(hosted, sizeof(hosted), "  plugin does not answer");
+      }
     } else {
-        Log("probe: %s (+0x%03zx) call %ld this=%p arg=%lu%s", entry.name, entry.offset,
-            entry.calls, self, argument, hosted);
+      std::snprintf(hosted, sizeof(hosted),
+                    "  no effect of ours at this pointer");
     }
+  }
+
+  if (entry.returns_value) {
+    Log("probe: %s (+0x%03zx) call %ld this=%p arg=%#lx -> %lu%s", entry.name,
+        entry.offset, entry.calls, self, argument, result, hosted);
+  } else {
+    Log("probe: %s (+0x%03zx) call %ld this=%p arg=%lu%s", entry.name,
+        entry.offset, entry.calls, self, argument, hosted);
+  }
 }
 
-extern "C" void BridgeReportSlot(unsigned int slot, void* self)
-{
-    if (slot >= sizeof(g_trace_slots) / sizeof(g_trace_slots[0])) {
-        return;
-    }
-    TraceSlot& entry = g_trace_slots[slot];
-    if (++entry.reports <= kTraceCap) {
-        Log("trace: AudioPlugin::%s  (+0x%03zx)", entry.name, entry.offset);
-    }
-
-    // The panel button is a show/hide toggle, not a second InitializeEffectEdit. Resolve builds its
-    // editor object once and from then on drives it with these two calls, so these are the ones the
-    // hosted window has to follow. Measured on 2026-08-24: one press logs UpdateEffectEditTitle and
-    // the OnEditorIdle heartbeat resumes; the next press logs HideSubWindows.
-    if (entry.offset == kUpdateEffectEditTitleOffset) {
-        BridgeEditorShowFor(EffectOrFocused(self), "UpdateEffectEditTitle");
-    } else if (entry.offset == kHideSubWindowsOffset) {
-        // A hide is a hide. This used to re-read a hide that arrived while the window was already
-        // gone as a show, to put Resolve's toggle back in phase after the window manager closed
-        // one of our windows - Resolve's editor object still believes it is showing and there is
-        // no way to tell it otherwise.
-        //
-        // That guess cost more than it paid. Close a plugin window, then close the modal, and the
-        // window came straight back: the modal's own hide arrived with our window already gone and
-        // was read as a request to open it. Reported by the tester on 2026-08-29, at 00:53 of the
-        // recording.
-        //
-        // The guess is not needed any more, because there is a real signal now: clicking the
-        // effect in the Audio FX panel calls InitializeEffectEdit and opens the window. A press of
-        // the panel toggle that spends itself hiding nothing is a cheap failure next to a window
-        // that reopens against the user.
-        BridgeEditorHideFor(EffectOrFocused(self), "HideSubWindows");
-    }
+extern "C" void BridgeReportSlot(unsigned int slot, void *self) {
+  if (slot >= sizeof(g_trace_slots) / sizeof(g_trace_slots[0])) {
+    return;
+  }
+  TraceSlot &entry = g_trace_slots[slot];
+  if (entry.reports++ < kTraceCap) {
+    Log("trace: %s (+0x%03zx) this=%p", entry.name, entry.offset, self);
+  }
+  // UpdateEffectEditTitle is only a title update. Visibility is handled by
+  // the verified ShowEditor(bool) slot, never by this diagnostic trace.
 }
 
-// Called from the X event pump the moment the window manager closes our window. Everything the
-// panel button does next lands in the log.
-extern "C" void BridgeArmEditorTrace()
-{
-    for (TraceSlot& entry : g_trace_slots) {
-        entry.reports = 0;
-    }
-    Log("trace: armed - the next %d calls per editor slot are logged", kTraceCap);
+// Called from the X event pump the moment the window manager closes our window.
+// Everything the panel button does next lands in the log.
+extern "C" void BridgeArmEditorTrace() {
+  if (!EnabledByEnvironment("FXBRIDGE_EDITOR_TRACE"))
+    return;
+  for (TraceSlot &entry : g_trace_slots) {
+    entry.reports = 0;
+  }
+  Log("trace: armed - the next %d calls per editor slot are logged", kTraceCap);
 }
 
 // ---------------------------------------------------------------------------
 // Our own vtable.
 //
-// Patching the stock BMDStereoDelay vtable makes every Delay in the project our effect: the hosted
-// plugin runs on all of them, the panel button drives all of them, and a real Delay is no longer a
-// real Delay. So the class vtable is left alone. Instead the whole vtable object is copied once,
-// our overrides go into the copy, and each instance we create is pointed at it.
+// Patching the stock BMDStereoDelay vtable makes every Delay in the project our
+// effect: the hosted plugin runs on all of them, the panel button drives all of
+// them, and a real Delay is no longer a real Delay. So the class vtable is left
+// alone. Instead the whole vtable object is copied once, our overrides go into
+// the copy, and each instance we create is pointed at it.
 //
-// The object holds five sub-vtables, each preceded by its offset-to-top and typeinfo words. An
-// instance carries one vptr per sub-vtable, and each vptr points at the first *function* slot -
-// sixteen bytes past the start of its group:
+// The object holds five sub-vtables, each preceded by its offset-to-top and
+// typeinfo words. An instance carries one vptr per sub-vtable, and each vptr
+// points at the first *function* slot - sixteen bytes past the start of its
+// group:
 //
 //     +0x010  primary (BMDAudioPluginImpl)      +0xa88  fourth
 //     +0x4f8  bmd::PluginInstance               +0xaa0  fifth
 //     +0x650  AudioPlugin  <- the one Resolve holds
 //
-// Where those vptrs sit inside the object is not documented, so the instance is scanned for the
-// five stock values instead of trusting an offset. A pointer-sized field that equals one of them
-// is a vptr; nothing else in the object can hold that address by accident.
+// Where those vptrs sit inside the object is not documented, so the instance is
+// scanned for the five stock values instead of trusting an offset. A
+// pointer-sized field that equals one of them is a vptr; nothing else in the
+// object can hold that address by accident.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -2800,59 +3202,64 @@ constexpr size_t kVptrGroupCount = sizeof(kVptrGroups) / sizeof(kVptrGroups[0]);
 
 // How far to look for vptrs, in both directions.
 //
-// CreatePluginInstance hands back the bmd::PluginInstance subobject, not the start of the object,
-// so the primary vptr is at a *lower* address. Scanning forward only finds four of the five groups
-// and misses the one that carries the name and the control tree. A word only counts as a vptr when
-// it equals one of the five stock group addresses exactly, so a wide scan cannot claim anything by
-// accident, and SafeRead turns a wrong guess into a skipped word instead of a fault.
-// Measured on 2026-08-24, and the reason the scan is this narrow:
+// CreatePluginInstance hands back the bmd::PluginInstance subobject, not the
+// start of the object, so the primary vptr is at a *lower* address. Scanning
+// forward only finds four of the five groups and misses the one that carries
+// the name and the control tree. A word only counts as a vptr when it equals
+// one of the five stock group addresses exactly, so a wide scan cannot claim
+// anything by accident, and SafeRead turns a wrong guess into a skipped word
+// instead of a fault. Measured on 2026-08-24, and the reason the scan is this
+// narrow:
 //
 //     instance-16   primary        (+0x010)
-//     instance+0    PluginInstance (+0x4f8)   <- what CreatePluginInstance returns
-//     instance+16   AudioPlugin    (+0x650)
-//     instance+200  (+0xa88)
+//     instance+0    PluginInstance (+0x4f8)   <- what CreatePluginInstance
+//     returns instance+16   AudioPlugin    (+0x650) instance+200  (+0xa88)
 //     instance+216  (+0xaa0)
 //
-// Every group lives inside 232 bytes. A wide scan is not merely wasteful, it is unsafe: any other
-// BMDStereoDelay on the heap holds these same five values, so a scan that runs past this object
-// will claim a neighbour's vptrs and make an unrelated effect ours.
+// Every group lives inside 232 bytes. A wide scan is not merely wasteful, it is
+// unsafe: any other BMDStereoDelay on the heap holds these same five values, so
+// a scan that runs past this object will claim a neighbour's vptrs and make an
+// unrelated effect ours.
 constexpr long kInstanceScanBack = -0x40;
 constexpr long kInstanceScanForward = 0x140;
 
-unsigned char* g_stock_vtable = nullptr;
-unsigned char* g_our_vtable = nullptr;
+unsigned char *g_stock_vtable = nullptr;
+unsigned char *g_our_vtable = nullptr;
 
 // Whether Resolve still owns this effect.
 //
-// Nothing tells the bridge that an effect is gone - the array only ever grows - so the object
-// itself is the only witness there is. A claimed instance carries our vptr in its primary
-// sub-object; once Resolve frees it, that word is either unmapped or somebody else's. Reading
-// it without faulting is exactly what SafeRead is for.
+// Nothing tells the bridge that an effect is gone - the array only ever grows -
+// so the object itself is the only witness there is. A claimed instance carries
+// our vptr in its primary sub-object; once Resolve frees it, that word is
+// either unmapped or somebody else's. Reading it without faulting is exactly
+// what SafeRead is for.
 //
-// This is what makes the per-instance key survive a project switch. Counting every effect ever
-// claimed would give the second project's first EQ the number 1, and the same project reopened
-// a third number again. Counting only the live ones gives it 0 every time.
-bool EffectIsLive(const ClaimedEffect& effect)
-{
-    if (effect.primary_base == nullptr) {
-        return true;  // never identified - assume live rather than silently drop it
-    }
-    unsigned long word = 0;
-    if (!SafeRead(effect.primary_base, &word, sizeof(word))) {
-        return false;
-    }
-    return word == reinterpret_cast<unsigned long>(g_our_vtable + 0x010);
+// This is what makes the per-instance key survive a project switch. Counting
+// every effect ever claimed would give the second project's first EQ the number
+// 1, and the same project reopened a third number again. Counting only the live
+// ones gives it 0 every time.
+bool EffectIsLive(const ClaimedEffect &effect) {
+  if (effect.primary_base == nullptr) {
+    return true; // never identified - assume live rather than silently drop it
+  }
+  unsigned long word = 0;
+  if (!SafeRead(effect.primary_base, &word, sizeof(word))) {
+    return false;
+  }
+  return word == reinterpret_cast<unsigned long>(g_our_vtable + 0x010);
 }
 
-// Set when a project is loading. The pass that follows catches the outgoing project's
-// settings before its plugins are forgotten - see the note on StateSaver.
+// Set when a project is loading. The pass that follows catches the outgoing
+// project's settings before its plugins are forgotten - see the note on
+// StateSaver.
 std::atomic<bool> g_state_flush{false};
 
 // Tell Resolve this effect changed, so that it asks for its state.
 //
-// The whole path was read out of libFairlightPage.so rather than probed a call at a time, after
-// two runs where a plugin's settings were changed, the timeline played and the project saved, and
-// StorePreset was called zero times each way:
+// The whole path was read out of libFairlightPage.so rather than probed a call
+// at a time, after two runs where a plugin's settings were changed, the
+// timeline played and the project saved, and StorePreset was called zero times
+// each way:
 //
 //     EffectsController::SaveEffectPresets      the project-save path
 //       -> [module id, effect group and position gates]
@@ -2861,262 +3268,286 @@ std::atomic<bool> g_state_flush{false};
 //       -> name, inputs, MIDI
 //       -> SetDirty(false)    at vptr+0x418 - cleared once the preset is taken
 //
-// So an effect is asked for its state only when it is marked dirty, and Resolve cannot mark ours:
-// an edit inside a hosted plugin's own window is invisible to it. What marks one dirty is
-// Effect::PluginParameterChanged, which is the listener NotifyParameterUpdate calls - the chain
-// that was guessed at earlier and is now traced.
+// So an effect is asked for its state only when it is marked dirty, and Resolve
+// cannot mark ours: an edit inside a hosted plugin's own window is invisible to
+// it. What marks one dirty is Effect::PluginParameterChanged, which is the
+// listener NotifyParameterUpdate calls - the chain that was guessed at earlier
+// and is now traced.
 //
-// None of that machinery is needed. AudioPlugin::SetDirty is two instructions of substance:
+// None of that machinery is needed. AudioPlugin::SetDirty is two instructions
+// of substance:
 //
-//     mov  %sil, 0x99(%rdi)     the flag, one byte in the AudioPlugin sub-object
-//     mov  0x40(%rdi), %rdi     its parent
-//     cmp  %rax, %rdi
-//     je   done                 a plugin that is its own parent stops here
-//     call *0x418(%rax)         otherwise the parent is marked too, all the way up
+//     mov  %sil, 0x99(%rdi)     the flag, one byte in the AudioPlugin
+//     sub-object mov  0x40(%rdi), %rdi     its parent cmp  %rax, %rdi je   done
+//     a plugin that is its own parent stops here call *0x418(%rax) otherwise
+//     the parent is marked too, all the way up
 //
-// and IsDirty is `cmpb $0x0, 0x99(%rdi)`. So the flag is set directly, on the AudioPlugin
-// sub-object, with no parameter index involved - which also means none of the risk that killed
-// two project loads today, because nothing here touches Fairlight's own arrays.
+// and IsDirty is `cmpb $0x0, 0x99(%rdi)`. So the flag is set directly, on the
+// AudioPlugin sub-object, with no parameter index involved - which also means
+// none of the risk that killed two project loads today, because nothing here
+// touches Fairlight's own arrays.
 //
-// The one hazard is in that disassembly and is guarded rather than hoped about: a null parent
-// would be dereferenced by `mov (%rdi),%rax` on the line after the compare. The parent word is
-// read first, and a null one means this effect is left alone.
+// The one hazard is in that disassembly and is guarded rather than hoped about:
+// a null parent would be dereferenced by `mov (%rdi),%rax` on the line after
+// the compare. The parent word is read first, and a null one means this effect
+// is left alone.
 constexpr size_t kSetDirtyOffset = 0xa68;
 constexpr size_t kIsDirtyOffset = 0xa70;
-// The flag and the parent are read out of SetDirty at load: g_layout.dirty_flag (0x99 in 21.1.0,
-// 0xa1 in 21.1.2) and g_layout.parent (0x40 in both).
+// The flag and the parent are read out of SetDirty at load: g_layout.dirty_flag
+// (0x99 in 21.1.0, 0xa1 in 21.1.2) and g_layout.parent (0x40 in both).
 
 // Does the project save walk our effect at all?
 //
-// Setting the dirty flag by hand did not bring StorePreset with it, and there are two possible
-// reasons that look identical from outside: the gates before IsDirty reject the effect, or
-// SaveEffectPresets never reaches it in the first place. IsDirty is the first thing that path
-// asks our effect, so watching it separates the two. It only logs and forwards.
-void* g_original_is_dirty = nullptr;
+// Setting the dirty flag by hand did not bring StorePreset with it, and there
+// are two possible reasons that look identical from outside: the gates before
+// IsDirty reject the effect, or SaveEffectPresets never reaches it in the first
+// place. IsDirty is the first thing that path asks our effect, so watching it
+// separates the two. It only logs and forwards.
+void *g_original_is_dirty = nullptr;
 
 // An effect that hosts a plugin is always worth asking.
 //
-// Measured on 2026-08-29: Resolve asks IsDirty once per effect on a project save - seven asks for
-// seven effects - and calls StorePreset on exactly the ones that answer true. So the flag is the
-// whole gate, and the question is only who sets it.
+// Measured on 2026-08-29: Resolve asks IsDirty once per effect on a project
+// save - seven asks for seven effects - and calls StorePreset on exactly the
+// ones that answer true. So the flag is the whole gate, and the question is
+// only who sets it.
 //
-// Setting it from a detected change does not work, and the reason is an old one. The state store
-// notices a change by comparing the plugin's own state blob against the last one; two Waves F6-RTA
-// were edited by hand in the same session and both returned a byte-identical blob, while smartEQ4
-// returned a different one and was marked. That is the "known miss" this project has carried since
-// v0.2.1, and chaining the dirty flag to it inherits the blindness whole.
+// Setting it from a detected change does not work, and the reason is an old
+// one. The state store notices a change by comparing the plugin's own state
+// blob against the last one; two Waves F6-RTA were edited by hand in the same
+// session and both returned a byte-identical blob, while smartEQ4 returned a
+// different one and was marked. That is the "known miss" this project has
+// carried since v0.2.1, and chaining the dirty flag to it inherits the
+// blindness whole.
 //
-// So the answer is not to detect better. An effect of ours holds state that only it can produce,
-// and the cost of answering true is one preset written per save. Resolve clears the flag itself
-// afterwards, at 14a7f1e, so nothing accumulates.
-bool BridgeIsDirty(void* self)
-{
-    bool answered = false;
-    if (g_original_is_dirty != nullptr) {
-        answered = reinterpret_cast<bool (*)(void*)>(g_original_is_dirty)(self);
-    }
-    const ClaimedEffect* const effect = FindEffectAny(self);
-    const bool ours = effect != nullptr && effect->plugin != nullptr;
-    static std::atomic<int> asked{0};
-    if (asked.fetch_add(1) < 16) {
-        Log("dirty: Resolve asked IsDirty - stock says %s, we answer %s%s",
-            answered ? "true" : "false", (answered || ours) ? "true" : "false",
-            ours && !answered ? "  (ours, so always worth storing)" : "");
-    }
-    return answered || ours;
+// So the answer is not to detect better. An effect of ours holds state that
+// only it can produce, and the cost of answering true is one preset written per
+// save. Resolve clears the flag itself afterwards, at 14a7f1e, so nothing
+// accumulates.
+bool BridgeIsDirty(void *self) {
+  bool answered = false;
+  if (g_original_is_dirty != nullptr) {
+    answered = reinterpret_cast<bool (*)(void *)>(g_original_is_dirty)(self);
+  }
+  const ClaimedEffect *const effect = FindEffectAny(self);
+  const bool ours = effect != nullptr && effect->plugin != nullptr;
+  static std::atomic<int> asked{0};
+  if (asked.fetch_add(1) < 16) {
+    Log("dirty: Resolve asked IsDirty - stock says %s, we answer %s%s",
+        answered ? "true" : "false", (answered || ours) ? "true" : "false",
+        ours && !answered ? "  (ours, so always worth storing)" : "");
+  }
+  return answered || ours;
 }
 
-void MarkEffectChanged(const ClaimedEffect& effect)
-{
-    if (!g_mark_dirty) {
-        return;
-    }
-    static std::atomic<int> told{0};
-    const int index = told.fetch_add(1);
-    const bool talk = index < 8;
+void MarkEffectChanged(const ClaimedEffect &effect) {
+  if (!g_mark_dirty) {
+    return;
+  }
+  static std::atomic<int> told{0};
+  const int index = told.fetch_add(1);
+  const bool talk = index < 8;
 
-    // Every reason this does nothing says so. A silent skip here reads as "Resolve was told"
-    // and is exactly how one of two effects went unmarked without a line in the log.
-    if (g_stock_vtable == nullptr) {
-        if (talk) { Log("dirty: no vtable yet - \"%s\" not marked", effect.state_key.c_str()); }
-        return;
-    }
-    void* const plugin = effect.audio_plugin_key;
-    if (plugin == nullptr) {
-        if (talk) {
-            Log("dirty: \"%s\" has no AudioPlugin pointer - not marked", effect.state_key.c_str());
-        }
-        return;
-    }
-    void* parent = nullptr;
-    if (!SafeRead(static_cast<unsigned char*>(plugin) + g_layout.parent, &parent,
-                  sizeof(parent))) {
-        if (talk) {
-            Log("dirty: \"%s\" would not let its parent be read - not marked",
-                effect.state_key.c_str());
-        }
-        return;
-    }
-    if (parent == nullptr) {
-        if (talk) {
-            Log("dirty: \"%s\" has a null parent, which SetDirty would dereference - not marked",
-                effect.state_key.c_str());
-        }
-        return;
-    }
-
-    using SetDirty = void (*)(void*, bool);
-    auto* const set_dirty = *reinterpret_cast<SetDirty*>(g_stock_vtable + kSetDirtyOffset);
-    set_dirty(plugin, true);
-
-    // Read the byte back. IsDirty is `cmpb $0x0, 0x99(%rdi)` in 21.1.0 (0xa1 in 21.1.2), so this
-    // is the exact thing Resolve will test, and reporting the write without reading it is how a
-    // no-op looks like a success.
-    unsigned char flag = 0;
-    const bool read = SafeRead(static_cast<unsigned char*>(plugin) + g_layout.dirty_flag, &flag,
-                               sizeof(flag));
+  // Every reason this does nothing says so. A silent skip here reads as
+  // "Resolve was told" and is exactly how one of two effects went unmarked
+  // without a line in the log.
+  if (g_stock_vtable == nullptr) {
     if (talk) {
-        Log("dirty: marked \"%s\" - the flag at +0x%zx now reads %s",
-            effect.state_key.c_str(), g_layout.dirty_flag,
-            !read ? "unreadable" : (flag != 0 ? "set" : "STILL CLEAR"));
+      Log("dirty: no vtable yet - \"%s\" not marked", effect.state_key.c_str());
     }
+    return;
+  }
+  void *const plugin = effect.audio_plugin_key;
+  if (plugin == nullptr) {
+    if (talk) {
+      Log("dirty: \"%s\" has no AudioPlugin pointer - not marked",
+          effect.state_key.c_str());
+    }
+    return;
+  }
+  void *parent = nullptr;
+  if (!SafeRead(static_cast<unsigned char *>(plugin) + g_layout.parent, &parent,
+                sizeof(parent))) {
+    if (talk) {
+      Log("dirty: \"%s\" would not let its parent be read - not marked",
+          effect.state_key.c_str());
+    }
+    return;
+  }
+  if (parent == nullptr) {
+    if (talk) {
+      Log("dirty: \"%s\" has a null parent, which SetDirty would dereference - "
+          "not marked",
+          effect.state_key.c_str());
+    }
+    return;
+  }
+
+  using SetDirty = void (*)(void *, bool);
+  auto *const set_dirty =
+      *reinterpret_cast<SetDirty *>(g_stock_vtable + kSetDirtyOffset);
+  set_dirty(plugin, true);
+
+  // Read the byte back. IsDirty is `cmpb $0x0, 0x99(%rdi)` in 21.1.0 (0xa1
+  // in 21.1.2), so this is the exact thing Resolve will test, and reporting the
+  // write without reading it is how a no-op looks like a success.
+  unsigned char flag = 0;
+  const bool read =
+      SafeRead(static_cast<unsigned char *>(plugin) + g_layout.dirty_flag,
+               &flag, sizeof(flag));
+  if (talk) {
+    Log("dirty: marked \"%s\" - the flag at +0x%zx now reads %s",
+        effect.state_key.c_str(), g_layout.dirty_flag,
+        !read ? "unreadable" : (flag != 0 ? "set" : "STILL CLEAR"));
+  }
 }
 
 class StateSaver final : public HostMainClient {
 public:
-    void OnHostMainTick() override
-    {
-        if (!g_state_flush.exchange(false) && ++ticks_ < kTicksBetweenSaves) {
-            return;
-        }
-        ticks_ = 0;
-        const size_t count = g_effect_count.load();
-        for (size_t index = 0; index < count; ++index) {
-            ClaimedEffect& effect = g_effects[index];
-            if (effect.plugin == nullptr || effect.state_key.empty()) {
-                continue;
-            }
-
-            // Each of the three ways an effect can stop being saved says so once. Silence here
-            // reads as "saved fine" and is how a skipped effect went unnoticed on 2026-08-29.
-            if (!EffectIsLive(effect)) {
-                if (!effect.state_said_gone) {
-                    effect.state_said_gone = true;
-                    Log("state: %s is gone from the project - not saved any more",
-                        effect.state_key.c_str());
-                }
-                continue;
-            }
-            std::vector<uint8_t> current;
-            if (!effect.plugin->SaveState(current)) {
-                if (!effect.state_said_mute) {
-                    effect.state_said_mute = true;
-                    Log("state: %s will not report its settings", effect.state_key.c_str());
-                }
-                continue;
-            }
-            if (current == effect.state_last) {
-                continue;
-            }
-            if (StateStoreWrite(effect.state_key, current)) {
-                Log("state: saved %zu bytes for %s", current.size(), effect.state_key.c_str());
-                effect.state_last.swap(current);
-                effect.state_stamp = static_cast<uint64_t>(std::time(nullptr));
-                MarkEffectChanged(effect);
-            }
-        }
+  void OnHostMainTick() override {
+    if (!g_state_flush.exchange(false) && ++ticks_ < kTicksBetweenSaves) {
+      return;
     }
+    ticks_ = 0;
+    const size_t count = g_effect_count.load();
+    for (size_t index = 0; index < count; ++index) {
+      ClaimedEffect &effect = g_effects[index];
+      if (effect.plugin == nullptr || effect.state_key.empty()) {
+        continue;
+      }
+
+      // Each of the three ways an effect can stop being saved says so once.
+      // Silence here reads as "saved fine" and is how a skipped effect went
+      // unnoticed on 2026-08-29.
+      if (!EffectIsLive(effect)) {
+        if (!effect.state_said_gone) {
+          effect.state_said_gone = true;
+          Log("state: %s is gone from the project - not saved any more",
+              effect.state_key.c_str());
+        }
+        continue;
+      }
+      std::vector<uint8_t> current;
+      if (!effect.plugin->SaveState(current)) {
+        if (!effect.state_said_mute) {
+          effect.state_said_mute = true;
+          Log("state: %s will not report its settings",
+              effect.state_key.c_str());
+        }
+        continue;
+      }
+      if (current == effect.state_last) {
+        continue;
+      }
+      if (StateStoreWrite(effect.state_key, current)) {
+        Log("state: saved %zu bytes for %s", current.size(),
+            effect.state_key.c_str());
+        effect.state_last.swap(current);
+        effect.state_stamp = static_cast<uint64_t>(std::time(nullptr));
+        MarkEffectChanged(effect);
+      }
+    }
+  }
 
 private:
-    static constexpr int kTicksBetweenSaves = 600;  // the tick is 16 ms, so about ten seconds
-    int ticks_ = 0;
+  static constexpr int kTicksBetweenSaves =
+      600; // the tick is 16 ms, so about ten seconds
+  int ticks_ = 0;
 };
 
 StateSaver g_state_saver;
 int g_instances_claimed = 0;
 
-// Write one slot in our own copy. No mprotect: this memory is ours and already writable.
-bool PatchOurSlot(size_t offset, void** saved, void* replacement)
-{
-    if (g_our_vtable == nullptr || offset + sizeof(void*) > kVtableBytes) {
-        return false;
-    }
-    auto* const slot = reinterpret_cast<void**>(g_our_vtable + offset);
-    if (saved != nullptr) {
-        *saved = *slot;
-    }
-    *slot = replacement;
-    return true;
+// Write one slot in our own copy. No mprotect: this memory is ours and already
+// writable.
+bool PatchOurSlot(size_t offset, void **saved, void *replacement) {
+  if (g_our_vtable == nullptr || offset + sizeof(void *) > kVtableBytes) {
+    return false;
+  }
+  auto *const slot = reinterpret_cast<void **>(g_our_vtable + offset);
+  if (saved != nullptr) {
+    *saved = *slot;
+  }
+  *slot = replacement;
+  return true;
 }
 
 // The Delay control tree.
 //
-// GenerateUserInterface builds the knobs Resolve draws in the effect panel. Our plugin brings its
-// own window, so the Delay's tree is 10 KB of controls for an effect that is not running. Not
-// calling it leaves the panel empty.
+// GenerateUserInterface builds the knobs Resolve draws in the effect panel. Our
+// plugin brings its own window, so the Delay's tree is 10 KB of controls for an
+// effect that is not running. Not calling it leaves the panel empty.
 //
-// The disassembly shows `mov %rdi,%r13` at entry and no second argument, so `this` is in rdi and
-// there is no sret. The return type is not visible, but a builder that returns a value is unlikely
-// and this now only affects instances we claimed.
+// The disassembly shows `mov %rdi,%r13` at entry and no second argument, so
+// `this` is in rdi and there is no sret. The return type is not visible, but a
+// builder that returns a value is unlikely and this now only affects instances
+// we claimed.
 constexpr size_t kGenerateUserInterfaceOffset = 0x460;
 
 // Where the effect name really comes from.
 //
-// SetUserEffectName runs and Resolve still shows "Delay", so the label is not the user name. The
-// disassembly of BMDAudioPlugin<BMDStereoDelay>::GetEffectName says where it does come from:
+// SetUserEffectName runs and Resolve still shows "Delay", so the label is not
+// the user name. The disassembly of
+// BMDAudioPlugin<BMDStereoDelay>::GetEffectName says where it does come from:
 //
 //     mov  0x550(%rsi), %rax     # rsi is `this`; a pointer field in the object
-//     mov  (%rax), %rsi          # the first word of that record is a char const*
-//     call flx::CA2W(char const*)
+//     mov  (%rax), %rsi          # the first word of that record is a char
+//     const* call flx::CA2W(char const*)
 //
-// So the name is one indirection off the primary object. Rather than hook a call that returns a
-// string by value, the record is cloned for our instance and the clone's name pointer is ours. The
-// stock record is untouched, so every other Delay keeps its own name.
+// So the name is one indirection off the primary object. Rather than hook a
+// call that returns a string by value, the record is cloned for our instance
+// and the clone's name pointer is ours. The stock record is untouched, so every
+// other Delay keeps its own name.
 //
-// 0x550 in 21.1.0, 0x558 in 21.1.2 - read out of that instruction when the bridge loads, as
-// g_layout.name_record.
+// 0x550 in 21.1.0, 0x558 in 21.1.2 - read out of that instruction when the
+// bridge loads, as g_layout.name_record.
 constexpr size_t kNameRecordCloneBytes = 256;
 
-void RenameInstance(void* primary_base, const ClaimedEffect* effect)
-{
-    if (!EnabledByEnvironment("FXBRIDGE_RENAME", true)) {
-        return;
-    }
-    if (primary_base == nullptr || effect == nullptr || effect->label_narrow[0] == '\0') {
-        return;
-    }
+void RenameInstance(void *primary_base, const ClaimedEffect *effect) {
+  if (!EnabledByEnvironment("FXBRIDGE_RENAME", true)) {
+    return;
+  }
+  if (primary_base == nullptr || effect == nullptr ||
+      effect->label_narrow[0] == '\0') {
+    return;
+  }
 
-    auto* const field = reinterpret_cast<unsigned char*>(primary_base) + g_layout.name_record;
-    void* record = nullptr;
-    if (!SafeRead(field, &record, sizeof(record)) || record == nullptr) {
-        Log("rename skipped: no name record at +0x%zx", g_layout.name_record);
-        return;
-    }
+  auto *const field =
+      reinterpret_cast<unsigned char *>(primary_base) + g_layout.name_record;
+  void *record = nullptr;
+  if (!SafeRead(field, &record, sizeof(record)) || record == nullptr) {
+    Log("rename skipped: no name record at +0x%zx", g_layout.name_record);
+    return;
+  }
 
-    const char* stock_name = nullptr;
-    if (SafeRead(record, &stock_name, sizeof(stock_name)) && stock_name != nullptr) {
-        char readable[64] = {0};
-        SafeRead(stock_name, readable, sizeof(readable) - 1);
-        Log("rename: the stock record at %p names the effect \"%s\"", record, readable);
-    }
+  const char *stock_name = nullptr;
+  if (SafeRead(record, &stock_name, sizeof(stock_name)) &&
+      stock_name != nullptr) {
+    char readable[64] = {0};
+    SafeRead(stock_name, readable, sizeof(readable) - 1);
+    Log("rename: the stock record at %p names the effect \"%s\"", record,
+        readable);
+  }
 
-    // Clone generously. Nothing is known about the rest of the record, so the copy keeps every
-    // field the stock one had and only the name pointer changes.
-    auto* const clone = static_cast<unsigned char*>(std::malloc(kNameRecordCloneBytes));
-    if (clone == nullptr) {
-        return;
-    }
-    std::memset(clone, 0, kNameRecordCloneBytes);
-    if (!SafeRead(record, clone, kNameRecordCloneBytes)) {
-        std::free(clone);
-        Log("rename skipped: the name record is not %zu bytes readable", kNameRecordCloneBytes);
-        return;
-    }
+  // Clone generously. Nothing is known about the rest of the record, so the
+  // copy keeps every field the stock one had and only the name pointer changes.
+  auto *const clone =
+      static_cast<unsigned char *>(std::malloc(kNameRecordCloneBytes));
+  if (clone == nullptr) {
+    return;
+  }
+  std::memset(clone, 0, kNameRecordCloneBytes);
+  if (!SafeRead(record, clone, kNameRecordCloneBytes)) {
+    std::free(clone);
+    Log("rename skipped: the name record is not %zu bytes readable",
+        kNameRecordCloneBytes);
+    return;
+  }
 
-    const char* const our_name = effect->label_narrow;
-    std::memcpy(clone, &our_name, sizeof(our_name));
-    *reinterpret_cast<void**>(field) = clone;
-    Log("rename: instance now names itself \"%s\"", effect->label_narrow);
+  const char *const our_name = effect->label_narrow;
+  std::memcpy(clone, &our_name, sizeof(our_name));
+  *reinterpret_cast<void **>(field) = clone;
+  Log("rename: instance now names itself \"%s\"", effect->label_narrow);
 }
 
 // The AudioPlugin group, and the slot that names the effect.
@@ -3125,203 +3556,231 @@ constexpr size_t kSetUserEffectNameOffset = 0x6b8;
 
 // Give the effect our name.
 //
-// The label is not hooked. GetEffectName returns a string by value, and faking an sret means
-// building whatever string type it returns. SetUserEffectName is the other side of the same pair
-// and its declaration already names the type: wchar_t const*. So the name is set, not faked.
-void NameInstance(void* audio_plugin_subobject, const ClaimedEffect* effect)
-{
-    if (audio_plugin_subobject == nullptr || effect == nullptr || effect->label_wide[0] == 0) {
-        return;
-    }
+// The label is not hooked. GetEffectName returns a string by value, and faking
+// an sret means building whatever string type it returns. SetUserEffectName is
+// the other side of the same pair and its declaration already names the type:
+// wchar_t const*. So the name is set, not faked.
+void NameInstance(void *audio_plugin_subobject, const ClaimedEffect *effect) {
+  if (audio_plugin_subobject == nullptr || effect == nullptr ||
+      effect->label_wide[0] == 0) {
+    return;
+  }
 
-    void** vtable = nullptr;
-    if (!SafeRead(audio_plugin_subobject, &vtable, sizeof(vtable)) || vtable == nullptr) {
-        return;
-    }
+  void **vtable = nullptr;
+  if (!SafeRead(audio_plugin_subobject, &vtable, sizeof(vtable)) ||
+      vtable == nullptr) {
+    return;
+  }
 
-    const size_t slot = (kSetUserEffectNameOffset - kAudioPluginGroup) / sizeof(void*);
-    using Setter = void (*)(void*, const wchar_t*);
-    reinterpret_cast<Setter>(vtable[slot])(audio_plugin_subobject, effect->label_wide);
-    Log("instance named \"%ls\" through SetUserEffectName", effect->label_wide);
+  const size_t slot =
+      (kSetUserEffectNameOffset - kAudioPluginGroup) / sizeof(void *);
+  using Setter = void (*)(void *, const wchar_t *);
+  reinterpret_cast<Setter>(vtable[slot])(audio_plugin_subobject,
+                                         effect->label_wide);
+  Log("instance named \"%ls\" through SetUserEffectName", effect->label_wide);
 }
 
-// Point one instance at our vtable. Returns how many vptr fields were rewritten.
-int ClaimInstance(void* instance)
-{
-    if (instance == nullptr || g_our_vtable == nullptr || g_stock_vtable == nullptr) {
-        return 0;
+// Point one instance at our vtable. Returns how many vptr fields were
+// rewritten.
+int ClaimInstance(void *instance) {
+  if (instance == nullptr || g_our_vtable == nullptr ||
+      g_stock_vtable == nullptr) {
+    return 0;
+  }
+
+  auto *const words = reinterpret_cast<unsigned char *>(instance);
+  void *audio_plugin_subobject = nullptr;
+  void *primary_base = nullptr;
+  int claimed = 0;
+  for (long offset = kInstanceScanBack; offset <= kInstanceScanForward;
+       offset += static_cast<long>(sizeof(void *))) {
+    unsigned long value = 0;
+    if (!SafeRead(words + offset, &value, sizeof(value))) {
+      continue; // a hole in the scan is not the end of the object
     }
-
-    auto* const words = reinterpret_cast<unsigned char*>(instance);
-    void* audio_plugin_subobject = nullptr;
-    void* primary_base = nullptr;
-    int claimed = 0;
-    for (long offset = kInstanceScanBack; offset <= kInstanceScanForward;
-         offset += static_cast<long>(sizeof(void*))) {
-        unsigned long value = 0;
-        if (!SafeRead(words + offset, &value, sizeof(value))) {
-            continue;  // a hole in the scan is not the end of the object
-        }
-        for (size_t group = 0; group < kVptrGroupCount; ++group) {
-            if (value != reinterpret_cast<unsigned long>(g_stock_vtable + kVptrGroups[group])) {
-                continue;
-            }
-            auto* const field = reinterpret_cast<void**>(words + offset);
-            *field = g_our_vtable + kVptrGroups[group];
-            Log("  vptr group +0x%03zx found at instance%+ld", kVptrGroups[group], offset);
-            if (kVptrGroups[group] == 0x010) {
-                primary_base = field;
-            }
-            if (kVptrGroups[group] == kAudioPluginGroup) {
-                // A vptr field is the first word of its subobject, so this address is the
-                // AudioPlugin `this` that Resolve itself passes around.
-                audio_plugin_subobject = field;
-            }
-            ++claimed;
-            break;
-        }
+    for (size_t group = 0; group < kVptrGroupCount; ++group) {
+      if (value != reinterpret_cast<unsigned long>(g_stock_vtable +
+                                                   kVptrGroups[group])) {
+        continue;
+      }
+      auto *const field = reinterpret_cast<void **>(words + offset);
+      *field = g_our_vtable + kVptrGroups[group];
+      Log("  vptr group +0x%03zx found at instance%+ld", kVptrGroups[group],
+          offset);
+      if (kVptrGroups[group] == 0x010) {
+        primary_base = field;
+      }
+      if (kVptrGroups[group] == kAudioPluginGroup) {
+        // A vptr field is the first word of its subobject, so this address is
+        // the AudioPlugin `this` that Resolve itself passes around.
+        audio_plugin_subobject = field;
+      }
+      ++claimed;
+      break;
     }
+  }
 
-    // This effect's own plugin, named by the menu entry the user picked. Nothing is shared with
-    // any other effect: two entries in one project are two plugins.
-    ClaimedEffect* const entry = AppendEffect(instance, audio_plugin_subobject);
-    if (entry != nullptr) {
-        const Clone* const chosen = g_creating_clone;
-        const char* const path = chosen != nullptr ? chosen->path.c_str() : ConfiguredPluginPath();
-        const PluginFormat format =
-            chosen != nullptr ? chosen->format : FormatFromPath(path);
-        SetEffectLabel(entry, chosen != nullptr ? chosen->name.c_str() : MenuNameFromPath(path));
-        const char* const class_name =
-            chosen != nullptr && !chosen->class_name.empty() ? chosen->class_name.c_str() : nullptr;
-        entry->plugin = CreateHostedPlugin(format, path, class_name, 48000.0, kMaxFrames);
-        if (entry->plugin != nullptr) {
-            entry->dry.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
-            entry->spare.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
-            g_focused_effect.store(entry);
-            if (class_name != nullptr) {
-                Log("effect: hosting \"%s\" - class \"%s\" from %s", entry->plugin->Name(),
-                    class_name, path);
-            } else {
-                Log("effect: hosting \"%s\" from %s", entry->plugin->Name(), path);
-            }
+  // This effect's own plugin, named by the menu entry the user picked. Nothing
+  // is shared with any other effect: two entries in one project are two
+  // plugins.
+  ClaimedEffect *const entry = AppendEffect(instance, audio_plugin_subobject);
+  if (entry != nullptr) {
+    const Clone *const chosen = g_creating_clone;
+    const char *const path =
+        chosen != nullptr ? chosen->path.c_str() : ConfiguredPluginPath();
+    const PluginFormat format =
+        chosen != nullptr ? chosen->format : FormatFromPath(path);
+    SetEffectLabel(entry, chosen != nullptr ? chosen->name.c_str()
+                                            : MenuNameFromPath(path));
+    const char *const class_name =
+        chosen != nullptr && !chosen->class_name.empty()
+            ? chosen->class_name.c_str()
+            : nullptr;
+    entry->plugin =
+        CreateHostedPlugin(format, path, class_name, 48000.0, kMaxFrames);
+    if (entry->plugin != nullptr) {
+      entry->dry.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
+      entry->spare.assign(static_cast<size_t>(kMaxChannels) * kMaxFrames, 0.0f);
+      if (class_name != nullptr) {
+        Log("effect: hosting \"%s\" - class \"%s\" from %s",
+            entry->plugin->Name(), class_name, path);
+      } else {
+        Log("effect: hosting \"%s\" from %s", entry->plugin->Name(), path);
+      }
 
-            // Settings from the last run, if the store is on and this plugin left any.
-            //
-            // Keyed per instance, not per plugin: the same EQ twice in one chain is two sets of
-            // settings, and sharing one file gave both of them whichever was touched last.
-            //
-            // The instance number is its position among the LIVE effects that host the same
-            // plugin, counted in the order Resolve claims them. That order is the order it
-            // deserialises the project in, so it is the same on every open - and counting only
-            // live effects is what makes it survive a project switch, since the outgoing
-            // project's entries are still in this array and must not be counted.
-            //
-            // What it cannot survive is a chain that is rearranged. Insert an EQ ahead of two
-            // others and every one after it shifts up a number, so they come back wearing each
-            // other's settings. That is the known cost of having no identity from Resolve.
-            if (StateStoreEnabled()) {
-                g_state_flush.store(true);
-                entry->state_base = StateStoreKey(path, class_name);
-                size_t ordinal = 0;
-                const size_t claimed_now = g_effect_count.load();
-                for (size_t other = 0; other < claimed_now; ++other) {
-                    const ClaimedEffect& sibling = g_effects[other];
-                    if (&sibling != entry && !sibling.state_base.empty() &&
-                        sibling.state_base == entry->state_base && EffectIsLive(sibling)) {
-                        ++ordinal;
-                    }
-                }
-                char suffix[24] = {0};
-                std::snprintf(suffix, sizeof(suffix), "-%zu", ordinal);
-                entry->state_key = entry->state_base + suffix;
-
-                std::vector<uint8_t> saved;
-                bool have = StateStoreRead(entry->state_key, saved);
-                if (!have && ordinal == 0) {
-                    // A file written before instance numbers existed. Read it once rather than
-                    // silently losing the settings of everyone who turned the store on in v0.2.0.
-                    have = StateStoreRead(entry->state_base, saved);
-                }
-                if (have && entry->plugin->LoadState(saved.data(), saved.size())) {
-                    entry->state_last = saved;
-                    uint64_t written = 0;
-                    if (StateStoreStamp(entry->state_key, &written) ||
-                        StateStoreStamp(entry->state_base, &written)) {
-                        entry->state_stamp = written;
-                    }
-                    Log("state: restored %zu bytes into \"%s\" #%zu", saved.size(),
-                        entry->plugin->Name(), ordinal);
-                }
-                HostMainRegister(&g_state_saver, 1000);
-            }
-
-            // BMDAudioPluginImpl::GetClipID - the word at this+0x1c8 - would have been a better
-            // key than a position in a list, if it held anything. Measured on 2026-08-29: zero,
-            // on all fourteen effects of a session. It is a clip id, and a track effect has no
-            // clip. The probe is gone; the finding is in the engineering log.
-        } else {
-            Log("effect: no plugin for %s - audio passes through", path);
+      // Settings from the last run, if the store is on and this plugin left
+      // any.
+      //
+      // Keyed per instance, not per plugin: the same EQ twice in one chain is
+      // two sets of settings, and sharing one file gave both of them whichever
+      // was touched last.
+      //
+      // The instance number is its position among the LIVE effects that host
+      // the same plugin, counted in the order Resolve claims them. That order
+      // is the order it deserialises the project in, so it is the same on every
+      // open - and counting only live effects is what makes it survive a
+      // project switch, since the outgoing project's entries are still in this
+      // array and must not be counted.
+      //
+      // What it cannot survive is a chain that is rearranged. Insert an EQ
+      // ahead of two others and every one after it shifts up a number, so they
+      // come back wearing each other's settings. That is the known cost of
+      // having no identity from Resolve.
+      if (StateStoreEnabled()) {
+        g_state_flush.store(true);
+        entry->state_base = StateStoreKey(path, class_name);
+        size_t ordinal = 0;
+        const size_t claimed_now = g_effect_count.load();
+        for (size_t other = 0; other < claimed_now; ++other) {
+          const ClaimedEffect &sibling = g_effects[other];
+          if (&sibling != entry && !sibling.state_base.empty() &&
+              sibling.state_base == entry->state_base &&
+              EffectIsLive(sibling)) {
+            ++ordinal;
+          }
         }
+        char suffix[24] = {0};
+        std::snprintf(suffix, sizeof(suffix), "-%zu", ordinal);
+        entry->state_key = entry->state_base + suffix;
+
+        std::vector<uint8_t> saved;
+        bool have = StateStoreRead(entry->state_key, saved);
+        if (!have && ordinal == 0) {
+          // A file written before instance numbers existed. Read it once rather
+          // than silently losing the settings of everyone who turned the store
+          // on in v0.2.0.
+          have = StateStoreRead(entry->state_base, saved);
+        }
+        if (have && entry->plugin->LoadState(saved.data(), saved.size())) {
+          entry->state_last = saved;
+          uint64_t written = 0;
+          if (StateStoreStamp(entry->state_key, &written) ||
+              StateStoreStamp(entry->state_base, &written)) {
+            entry->state_stamp = written;
+          }
+          Log("state: restored %zu bytes into \"%s\" #%zu", saved.size(),
+              entry->plugin->Name(), ordinal);
+        }
+        HostMainRegister(&g_state_saver, 1000);
+      }
+
+      // BMDAudioPluginImpl::GetClipID - the word at this+0x1c8 - would have
+      // been a better key than a position in a list, if it held anything.
+      // Measured on 2026-08-29: zero, on all fourteen effects of a session. It
+      // is a clip id, and a track effect has no clip. The probe is gone; the
+      // finding is in the engineering log.
     } else {
-        Log("effect: more than %zu effects claimed, this one gets no plugin", kMaxClaimedEffects);
+      Log("effect: no plugin for %s - audio passes through", path);
     }
+  } else {
+    Log("effect: more than %zu effects claimed, this one gets no plugin",
+        kMaxClaimedEffects);
+  }
 
-    if (entry != nullptr) {
-        entry->primary_base = primary_base;
+  if (entry != nullptr) {
+    entry->primary_base = primary_base;
+  }
+
+  NameInstance(audio_plugin_subobject, entry);
+  RenameInstance(primary_base, entry);
+
+  // RETRACTED. This said that with no control tree Resolve never calls
+  // InitializeEffectEdit, on a 2026-08-24 reading of the log. It does call it -
+  // see the note below the deadlock warning.
+  //
+  // It must not open it HERE. This runs inside Resolve's LoadPlugin, and on a
+  // project switch that whole chain sits under StudioModel::Deserialize on the
+  // main thread. Opening a bridged Windows plugin's editor from there enters
+  // libyabridge-vst3, which waits on a condition variable for its Wine host -
+  // and the thread that would service the answer is the one being stood on.
+  //
+  // Caught live on 2026-08-26: two projects open, switch between them, Resolve
+  // frozen with a black editor. The main thread sat in pthread_cond_wait,
+  // eleven frames above StudioModel::Deserialize, with Vst3Plugin::OpenEditor
+  // in between. All 329 threads sleeping, nothing logged after "window:
+  // created". It never recovers.
+  //
+  // Only the want is recorded now. BridgeEditorReassert opens it from the
+  // window pump thread, so a plugin that stalls costs its own editor rather
+  // than the whole application.
+  //
+  // OFF by default since v0.2.4, and the paragraph above it was wrong. Resolve
+  // DOES call InitializeEffectEdit with the panel suppressed - measured
+  // 2026-08-29, one click on the effect in the Audio FX panel logs "editor:
+  // shown (AudioPlugin::InitializeEffectEdit)". The 2026-08-24 measurement that
+  // said otherwise watched the primary slot; the one that fires is the
+  // AudioPlugin base at +0x7b0.
+  //
+  // So there is a real open signal and the bridge does not have to open every
+  // editor to be sure one can be opened. Opening them all was the worst thing
+  // this bridge did to a large project: every plugin GUI constructed during the
+  // project load, for effects the user may never touch. Reported as the biggest
+  // issue by the tester on 2026-08-29.
+  //
+  // The pump still starts here. It has to: it is the only thread that opens an
+  // editor, and until it existed the first window could never appear -
+  // u/Stroomer0, 2026-08-28, plugins listed and no window.
+  if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true) && entry != nullptr) {
+    if (EnabledByEnvironment("FXBRIDGE_OPEN_ON_CLAIM")) {
+      entry->editor_wanted.store(true);
     }
+    // And the thread that acts on that want. Until this call existed the pump
+    // started inside PluginWindowCreate, so the only thread that could open the
+    // first editor was one that a window had to exist to start. Every editor
+    // that did open was opened by Resolve's own panel button instead, which hid
+    // the hole on any machine where that button is used. Reported by
+    // u/Stroomer0 on 2026-08-28: plugins listed, no window.
+    PluginWindowStartPump();
+  }
 
-    NameInstance(audio_plugin_subobject, entry);
-    RenameInstance(primary_base, entry);
-
-    // RETRACTED. This said that with no control tree Resolve never calls InitializeEffectEdit, on a
-    // 2026-08-24 reading of the log. It does call it - see the note below the deadlock warning.
-    //
-    // It must not open it HERE. This runs inside Resolve's LoadPlugin, and on a project switch that
-    // whole chain sits under StudioModel::Deserialize on the main thread. Opening a bridged Windows
-    // plugin's editor from there enters libyabridge-vst3, which waits on a condition variable for
-    // its Wine host - and the thread that would service the answer is the one being stood on.
-    //
-    // Caught live on 2026-08-26: two projects open, switch between them, Resolve frozen with a
-    // black editor. The main thread sat in pthread_cond_wait, eleven frames above
-    // StudioModel::Deserialize, with Vst3Plugin::OpenEditor in between. All 329 threads sleeping,
-    // nothing logged after "window: created". It never recovers.
-    //
-    // Only the want is recorded now. BridgeEditorReassert opens it from the window pump thread, so
-    // a plugin that stalls costs its own editor rather than the whole application.
-    //
-    // OFF by default since v0.2.4, and the paragraph above it was wrong. Resolve DOES call
-    // InitializeEffectEdit with the panel suppressed - measured 2026-08-29, one click on the effect
-    // in the Audio FX panel logs "editor: shown (AudioPlugin::InitializeEffectEdit)". The
-    // 2026-08-24 measurement that said otherwise watched the primary slot; the one that fires is
-    // the AudioPlugin base at +0x7b0.
-    //
-    // So there is a real open signal and the bridge does not have to open every editor to be sure
-    // one can be opened. Opening them all was the worst thing this bridge did to a large project:
-    // every plugin GUI constructed during the project load, for effects the user may never touch.
-    // Reported as the biggest issue by the tester on 2026-08-29.
-    //
-    // The pump still starts here. It has to: it is the only thread that opens an editor, and until
-    // it existed the first window could never appear - u/Stroomer0, 2026-08-28, plugins listed and
-    // no window.
-    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true) && entry != nullptr) {
-        if (EnabledByEnvironment("FXBRIDGE_OPEN_ON_CLAIM")) {
-            entry->editor_wanted.store(true);
-        }
-        // And the thread that acts on that want. Until this call existed the pump started
-        // inside PluginWindowCreate, so the only thread that could open the first editor was
-        // one that a window had to exist to start. Every editor that did open was opened by
-        // Resolve's own panel button instead, which hid the hole on any machine where that
-        // button is used. Reported by u/Stroomer0 on 2026-08-28: plugins listed, no window.
-        PluginWindowStartPump();
-    }
-
-    return claimed;
+  return claimed;
 }
 
-}  // namespace
+} // namespace
 
-// The resource tree lives at this+0x360, and the stock builder writes the panel extents on the
-// object itself. Read out of BMDStereoDelay::GenerateUserInterface:
+// The resource tree lives at this+0x360, and the stock builder writes the panel
+// extents on the object itself. Read out of
+// BMDStereoDelay::GenerateUserInterface:
 //
 //     lea  0x360(%r13), %r14     # r13 is `this` - the PluginUIResourceTree
 //     call SimpleUiGenerator::GetDefaultBackgroundColor()
@@ -3331,161 +3790,173 @@ int ClaimInstance(void* instance)
 //
 // and the controls are added through these, all exported and all named:
 //
-//     BMDAudioPluginImpl::BindParameterByName(char const*)  -> a PluginUIBinding*
-//     bmd::PluginUIResourceTree::AddKnob(binding, ..., label, ..., min, max, ...)
-//     bmd::PluginUIResourceTree::AddText / AddFrame / AddMeter / AddComboBoxToToolbar
+//     BMDAudioPluginImpl::BindParameterByName(char const*)  -> a
+//     PluginUIBinding* bmd::PluginUIResourceTree::AddKnob(binding, ..., label,
+//     ..., min, max, ...) bmd::PluginUIResourceTree::AddText / AddFrame /
+//     AddMeter / AddComboBoxToToolbar
 //
-// So replacing the panel is a matter of building this tree ourselves. What is not yet known is the
-// tree's own layout, which is why this step lets the stock builder run and then reads the result.
+// So replacing the panel is a matter of building this tree ourselves. What is
+// not yet known is the tree's own layout, which is why this step lets the stock
+// builder run and then reads the result.
 //
-// The tree and the two sizes are 0x360, 0x3a8 and 0x3ac in 21.1.0, 0x368, 0x3b0 and 0x3b4 in
-// 21.1.2 - read out of those instructions at load, as g_layout.resource_tree, .panel_width and
-// .panel_height. The strip below WRITES at tree+0x18, so a stale tree offset is not a wrong
-// read but eight bytes of Resolve's object overwritten.
+// The tree and the two sizes are 0x360, 0x3a8 and 0x3ac in 21.1.0, 0x368, 0x3b0
+// and 0x3b4 in 21.1.2 - read out of those instructions at load, as
+// g_layout.resource_tree, .panel_width and .panel_height. The strip below
+// WRITES at tree+0x18, so a stale tree offset is not a wrong read but eight
+// bytes of Resolve's object overwritten.
 
 // The tree's item list. Dumped from a freshly built Delay panel on 2026-08-24:
 //
 //     tree+0x00  0x7ff76f0b4aa8   a vptr - the tree is a real object
 //     tree+0x10  0x7ff72b6baf00   begin
-//     tree+0x18  0x7ff72b6bafc8   end            (end - begin = 0xc8 = 25 items)
-//     tree+0x20  0x7ff72b6bb000   capacity end
+//     tree+0x18  0x7ff72b6bafc8   end            (end - begin = 0xc8 = 25
+//     items) tree+0x20  0x7ff72b6bb000   capacity end
 //
-// Three ascending pointers with end below the capacity end is a std::vector, and 25 items matches
-// the Delay's knobs, text and frames.
+// Three ascending pointers with end below the capacity end is a std::vector,
+// and 25 items matches the Delay's knobs, text and frames.
 constexpr size_t kTreeItemsBegin = 0x10;
 constexpr size_t kTreeItemsEnd = 0x18;
 
-extern "C" void BridgeGenerateUserInterface(void* self)
-{
-    (void)self;
-    // Reached only while the switch is on: the slot is not patched otherwise.
-    static bool reported = false;
+extern "C" void BridgeGenerateUserInterface(void *self) {
+  (void)self;
+  // Reached only while the switch is on: the slot is not patched otherwise.
+  static bool reported = false;
 
-    // Let the stock builder run, then empty the tree.
-    //
-    // Skipping the builder was the first attempt and it crashed: Resolve builds its editor from
-    // this tree, and a tree that was never built is all zeros, so the first virtual call on it
-    // jumps into nothing. Running the builder and then truncating its item list leaves a tree that
-    // is fully constructed and simply has no controls in it - which is what an empty panel should
-    // have been from the start.
-    //
-    // The items are leaked. They belong to the tree's own allocator and 25 small objects once per
-    // effect is not worth the risk of freeing something we do not own.
-    using Builder = void (*)(void*);
-    void* const stock =
-        g_stock_vtable != nullptr
-            ? *reinterpret_cast<void**>(g_stock_vtable + kGenerateUserInterfaceOffset)
-            : nullptr;
-    if (stock != nullptr) {
-        reinterpret_cast<Builder>(stock)(self);
+  // Let the stock builder run, then empty the tree.
+  //
+  // Skipping the builder was the first attempt and it crashed: Resolve builds
+  // its editor from this tree, and a tree that was never built is all zeros, so
+  // the first virtual call on it jumps into nothing. Running the builder and
+  // then truncating its item list leaves a tree that is fully constructed and
+  // simply has no controls in it - which is what an empty panel should have
+  // been from the start.
+  //
+  // The items are leaked. They belong to the tree's own allocator and 25 small
+  // objects once per effect is not worth the risk of freeing something we do
+  // not own.
+  using Builder = void (*)(void *);
+  void *const stock = g_stock_vtable != nullptr
+                          ? *reinterpret_cast<void **>(
+                                g_stock_vtable + kGenerateUserInterfaceOffset)
+                          : nullptr;
+  if (stock != nullptr) {
+    reinterpret_cast<Builder>(stock)(self);
+  }
+
+  auto *const tree =
+      reinterpret_cast<unsigned char *>(self) + g_layout.resource_tree;
+  void *begin = nullptr;
+  void *end = nullptr;
+  if (SafeRead(tree + kTreeItemsBegin, &begin, sizeof(begin)) &&
+      SafeRead(tree + kTreeItemsEnd, &end, sizeof(end)) && begin != nullptr &&
+      end >= begin) {
+    const long items = (reinterpret_cast<const char *>(end) -
+                        reinterpret_cast<const char *>(begin)) /
+                       8;
+    *reinterpret_cast<void **>(tree + kTreeItemsEnd) = begin;
+    if (!reported) {
+      Log("panel: the stock tree had %ld items, now none", items);
     }
+  } else if (!reported) {
+    Log("panel: the tree does not look like a vector - left as the stock built "
+        "it");
+  }
 
-    auto* const tree = reinterpret_cast<unsigned char*>(self) + g_layout.resource_tree;
-    void* begin = nullptr;
-    void* end = nullptr;
-    if (SafeRead(tree + kTreeItemsBegin, &begin, sizeof(begin)) &&
-        SafeRead(tree + kTreeItemsEnd, &end, sizeof(end)) && begin != nullptr && end >= begin) {
-        const long items = (reinterpret_cast<const char*>(end) -
-                            reinterpret_cast<const char*>(begin)) / 8;
-        *reinterpret_cast<void**>(tree + kTreeItemsEnd) = begin;
-        if (!reported) {
-            Log("panel: the stock tree had %ld items, now none", items);
+  if (EnabledByEnvironment("FXBRIDGE_STUDY_PANEL")) {
+    if (!reported) {
+      reported = true;
+      auto *const bytes = reinterpret_cast<const unsigned char *>(self);
+      float width = 0.0f;
+      float height = 0.0f;
+      std::memcpy(&width, bytes + g_layout.panel_width, sizeof(width));
+      std::memcpy(&height, bytes + g_layout.panel_height, sizeof(height));
+      Log("panel: the stock tree is built - %.0f x %.0f",
+          static_cast<double>(width), static_cast<double>(height));
+      const unsigned char *const tree = bytes + g_layout.resource_tree;
+      char line[200];
+      for (int row = 0; row < 4; ++row) {
+        int written =
+            std::snprintf(line, sizeof(line), "panel: tree+0x%02x ", row * 16);
+        for (int column = 0;
+             column < 16 && written < static_cast<int>(sizeof(line)) - 4;
+             ++column) {
+          written += std::snprintf(line + written, sizeof(line) - written,
+                                   "%02x ", tree[row * 16 + column]);
         }
-    } else if (!reported) {
-        Log("panel: the tree does not look like a vector - left as the stock built it");
+        Log("%s", line);
+      }
     }
+  }
 
-    if (EnabledByEnvironment("FXBRIDGE_STUDY_PANEL")) {
-        if (!reported) {
-            reported = true;
-            auto* const bytes = reinterpret_cast<const unsigned char*>(self);
-            float width = 0.0f;
-            float height = 0.0f;
-            std::memcpy(&width, bytes + g_layout.panel_width, sizeof(width));
-            std::memcpy(&height, bytes + g_layout.panel_height, sizeof(height));
-            Log("panel: the stock tree is built - %.0f x %.0f", static_cast<double>(width),
-                static_cast<double>(height));
-            const unsigned char* const tree = bytes + g_layout.resource_tree;
-            char line[200];
-            for (int row = 0; row < 4; ++row) {
-                int written = std::snprintf(line, sizeof(line), "panel: tree+0x%02x ", row * 16);
-                for (int column = 0; column < 16 && written < static_cast<int>(sizeof(line)) - 4;
-                     ++column) {
-                    written += std::snprintf(line + written, sizeof(line) - written, "%02x ",
-                                             tree[row * 16 + column]);
-                }
-                Log("%s", line);
-            }
-        }
-    }
-
-    reported = true;
+  reported = true;
 }
 
-// Redirect the stock GenerateUserInterface slot, and put it back. Only the create call for our own
-// effect runs with this on.
-extern "C" void BridgeSuppressStockUserInterface(bool on)
-{
-    static void* saved = nullptr;
-    if (g_stock_vtable == nullptr) {
-        return;
+// Redirect the stock GenerateUserInterface slot, and put it back. Only the
+// create call for our own effect runs with this on.
+extern "C" void BridgeSuppressStockUserInterface(bool on) {
+  static void *saved = nullptr;
+  if (g_stock_vtable == nullptr) {
+    return;
+  }
+  if (on) {
+    if (saved != nullptr) {
+      return; // already on; never save our own function over the stock one
     }
-    if (on) {
-        if (saved != nullptr) {
-            return;  // already on; never save our own function over the stock one
-        }
-        PatchVtableSlot(g_stock_vtable, kGenerateUserInterfaceOffset, &saved,
-                        reinterpret_cast<void*>(&BridgeGenerateUserInterface));
-        return;
-    }
-    if (saved == nullptr) {
-        return;
-    }
-    PatchVtableSlot(g_stock_vtable, kGenerateUserInterfaceOffset, nullptr, saved);
-    saved = nullptr;
+    PatchVtableSlot(g_stock_vtable, kGenerateUserInterfaceOffset, &saved,
+                    reinterpret_cast<void *>(&BridgeGenerateUserInterface));
+    return;
+  }
+  if (saved == nullptr) {
+    return;
+  }
+  PatchVtableSlot(g_stock_vtable, kGenerateUserInterfaceOffset, nullptr, saved);
+  saved = nullptr;
 }
 
 // Called from the create trampoline's exit, for our instances only.
-extern "C" void BridgeClaimInstance(void* instance)
-{
-    const int claimed = ClaimInstance(instance);
-    ++g_instances_claimed;
-    Log("instance %d at %p: %d vptr%s rewritten to our vtable%s",
-        g_instances_claimed, instance, claimed, claimed == 1 ? "" : "s",
-        claimed == 0 ? "  <- the effect will do nothing" : "");
+extern "C" void BridgeClaimInstance(void *instance) {
+  const int claimed = ClaimInstance(instance);
+  ++g_instances_claimed;
+  Log("instance %d at %p: %d vptr%s rewritten to our vtable%s",
+      g_instances_claimed, instance, claimed, claimed == 1 ? "" : "s",
+      claimed == 0 ? "  <- the effect will do nothing" : "");
 }
 
 namespace {
 
-
 // ---------------------------------------------------------------------------
 // The parameter probe.
 //
-// The question. A hosted plugin's settings live in a file on a timer, because a project save
-// asks the effect nothing at all - StorePreset, LoadPreset and GetParameterValue all fire zero
-// times on a Ctrl+S. What Resolve does save is the parameter values it holds for a built-in
-// effect, and it hands them back on load through SetParameterValue: twenty-four non-default
-// values arrived that way on 2026-08-29. So there IS a per-effect channel into the project
+// The question. A hosted plugin's settings live in a file on a timer, because a
+// project save asks the effect nothing at all - StorePreset, LoadPreset and
+// GetParameterValue all fire zero times on a Ctrl+S. What Resolve does save is
+// the parameter values it holds for a built-in effect, and it hands them back
+// on load through SetParameterValue: twenty-four non-default values arrived
+// that way on 2026-08-29. So there IS a per-effect channel into the project
 // file. What is not known is whether it will carry a value this side invented.
 //
-// The probe answers exactly that and nothing else. Each claimed effect reports four parameters
-// more than the carrier owns, we give those four distinctive values, and NotifyParameterUpdate
-// tells Resolve they moved. Then: save the project, quit, start again. If those four values
-// come back through SetParameterValue, the channel is real and the plugin's own parameter list
-// goes down it next. If they do not, the file store is what there is, and that is written down
-// rather than guessed at again.
+// The probe answers exactly that and nothing else. Each claimed effect reports
+// four parameters more than the carrier owns, we give those four distinctive
+// values, and NotifyParameterUpdate tells Resolve they moved. Then: save the
+// project, quit, start again. If those four values come back through
+// SetParameterValue, the channel is real and the plugin's own parameter list
+// goes down it next. If they do not, the file store is what there is, and that
+// is written down rather than guessed at again.
 //
-// Why this is safe to leave enabled. Every indexed accessor in BMDAudioPluginImpl guards its
-// vector the same way - load begin at +0x2c8 and end at +0x2d0, subtract, shift, compare, and
-// jump past on jbe. Verified in the disassembly for GetParameterValue, GetParameterName,
-// GetParameterDisplayValue, GetControlType, ParameterCanAutomate, GetAutomationState and
-// SetAutomationState. An index above the real count reads nothing and returns a default, so
-// over-reporting the count cannot make the stock code walk off its own vector.
+// Why this is safe to leave enabled. Every indexed accessor in
+// BMDAudioPluginImpl guards its vector the same way - load begin at +0x2c8 and
+// end at +0x2d0, subtract, shift, compare, and jump past on jbe. Verified in
+// the disassembly for GetParameterValue, GetParameterName,
+// GetParameterDisplayValue, GetControlType, ParameterCanAutomate,
+// GetAutomationState and SetAutomationState. An index above the real count
+// reads nothing and returns a default, so over-reporting the count cannot make
+// the stock code walk off its own vector.
 //
-// Resolve reaches these through two vtable slots, not one: the primary group for calls on the
-// BMDAudioPluginImpl base, and the AudioPlugin group at the far end for calls on the pointer
-// the Fairlight engine holds. Both are patched, because which one arrives is not this side's
-// choice, and the two get different `this` values - the thunk's is 0x20 higher.
+// Resolve reaches these through two vtable slots, not one: the primary group
+// for calls on the BMDAudioPluginImpl base, and the AudioPlugin group at the
+// far end for calls on the pointer the Fairlight engine holds. Both are
+// patched, because which one arrives is not this side's choice, and the two get
+// different `this` values - the thunk's is 0x20 higher.
 // ---------------------------------------------------------------------------
 
 constexpr size_t kGetNumberOfParametersOffset = 0x2c8;
@@ -3498,373 +3969,390 @@ constexpr size_t kGetControlTypeThunkOffset = 0x900;
 constexpr size_t kGetParameterNameOffset = 0x2d0;
 constexpr size_t kGetParameterNameThunkOffset = 0x8f8;
 
-void* g_original_parameter_count = nullptr;
-void* g_original_parameter_count_thunk = nullptr;
-void* g_original_parameter_value = nullptr;
-void* g_original_parameter_value_thunk = nullptr;
-void* g_original_set_parameter_thunk = nullptr;
-void* g_original_control_type = nullptr;
-void* g_original_control_type_thunk = nullptr;
-void* g_original_parameter_name = nullptr;
-void* g_original_parameter_name_thunk = nullptr;
+void *g_original_parameter_count = nullptr;
+void *g_original_parameter_count_thunk = nullptr;
+void *g_original_parameter_value = nullptr;
+void *g_original_parameter_value_thunk = nullptr;
+void *g_original_set_parameter_thunk = nullptr;
+void *g_original_control_type = nullptr;
+void *g_original_control_type_thunk = nullptr;
+void *g_original_parameter_name = nullptr;
+void *g_original_parameter_name_thunk = nullptr;
 
-// Arms the notify pass. Separate from FXBRIDGE_PARAM_PROBE because one half of the probe only
-// reads and the other half killed Resolve - see ProbeNotifier.
+// Arms the notify pass. Separate from FXBRIDGE_PARAM_PROBE because one half of
+// the probe only reads and the other half killed Resolve - see ProbeNotifier.
 bool g_probe_notify = false;
 
-unsigned long ProbeParameterCount(void* self, void* original)
-{
-    unsigned long stock = 0;
-    if (original != nullptr) {
-        stock = reinterpret_cast<unsigned long (*)(void*)>(original)(self);
+unsigned long ProbeParameterCount(void *self, void *original) {
+  unsigned long stock = 0;
+  if (original != nullptr) {
+    stock = reinterpret_cast<unsigned long (*)(void *)>(original)(self);
+  }
+  ClaimedEffect *const effect = FindEffectAny(self);
+  if (effect == nullptr || effect->plugin == nullptr || stock == 0) {
+    return stock;
+  }
+  if (effect->stock_params == 0) {
+    effect->stock_params = static_cast<unsigned int>(stock);
+    for (unsigned int slot = 0; slot < kProbeParameters; ++slot) {
+      effect->probe[slot] = ProbeSeed(slot);
     }
-    ClaimedEffect* const effect = FindEffectAny(self);
-    if (effect == nullptr || effect->plugin == nullptr || stock == 0) {
-        return stock;
-    }
-    if (effect->stock_params == 0) {
-        effect->stock_params = static_cast<unsigned int>(stock);
-        for (unsigned int slot = 0; slot < kProbeParameters; ++slot) {
-            effect->probe[slot] = ProbeSeed(slot);
-        }
-        Log("probe: \"%s\" owns %lu parameters and now reports %lu",
-            effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect", stock,
-            stock + kProbeParameters);
-    }
-    return stock + kProbeParameters;
+    Log("probe: \"%s\" owns %lu parameters and now reports %lu",
+        effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
+        stock, stock + kProbeParameters);
+  }
+  return stock + kProbeParameters;
 }
 
-float ProbeParameterValue(void* self, unsigned int index, void* original)
-{
-    ClaimedEffect* const effect = FindEffectAny(self);
-    if (effect != nullptr && effect->stock_params != 0 && index >= effect->stock_params &&
-        index < effect->stock_params + kProbeParameters) {
-        const unsigned int slot = index - effect->stock_params;
-        static std::atomic<int> reads{0};
-        if (reads.fetch_add(1) < 16) {
-            Log("probe: Resolve read parameter %u (probe %u) of \"%s\" - %.6f", index, slot,
-                effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
-                static_cast<double>(effect->probe[slot]));
-        }
-        return effect->probe[slot];
+float ProbeParameterValue(void *self, unsigned int index, void *original) {
+  ClaimedEffect *const effect = FindEffectAny(self);
+  if (effect != nullptr && effect->stock_params != 0 &&
+      index >= effect->stock_params &&
+      index < effect->stock_params + kProbeParameters) {
+    const unsigned int slot = index - effect->stock_params;
+    static std::atomic<int> reads{0};
+    if (reads.fetch_add(1) < 16) {
+      Log("probe: Resolve read parameter %u (probe %u) of \"%s\" - %.6f", index,
+          slot,
+          effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
+          static_cast<double>(effect->probe[slot]));
     }
-    if (original != nullptr) {
-        return reinterpret_cast<float (*)(void*, unsigned int)>(original)(self, index);
-    }
-    return 0.0f;
+    return effect->probe[slot];
+  }
+  if (original != nullptr) {
+    return reinterpret_cast<float (*)(void *, unsigned int)>(original)(self,
+                                                                       index);
+  }
+  return 0.0f;
 }
 
 // The one accessor in BMDAudioPluginImpl that does not check the index.
 //
-// This is not an opinion. Every function in that class that indexes the control vector was read
-// mechanically on 2026-08-29 - twenty-nine of them - asking one question: after the vector is
-// loaded from this+0x2c8, does a conditional branch run BEFORE the indexed load? Twenty-eight
-// branch first. GetControlType does not:
+// This is not an opinion. Every function in that class that indexes the control
+// vector was read mechanically on 2026-08-29 - twenty-nine of them - asking one
+// question: after the vector is loaded from this+0x2c8, does a conditional
+// branch run BEFORE the indexed load? Twenty-eight branch first. GetControlType
+// does not:
 //
 //     mov 0x2c8(%rdi),%rcx      # the vector
 //     mov (%rcx,%rax,8),%rax    # vec[index], with nothing checked
 //     mov 0x18(%rax),%eax       # <- the fault, at +0x24, with rax == 0
 //
-// Fairlight walks 0 to GetNumberOfParameters()-1 calling it - EffectImpl::CreateLinkToStudio,
-// under StudioModel::Deserialize - so raising the count without answering this call kills the
-// project load. That is what happened twice on 2026-08-29, and the backtrace that named it is
-// the reason the bridge now installs a fault handler.
+// Fairlight walks 0 to GetNumberOfParameters()-1 calling it -
+// EffectImpl::CreateLinkToStudio, under StudioModel::Deserialize - so raising
+// the count without answering this call kills the project load. That is what
+// happened twice on 2026-08-29, and the backtrace that named it is the reason
+// the bridge now installs a fault handler.
 //
-// The probe's indices answer as the carrier's own first control does, because that is a real
-// control type rather than the zero the stock returns for something it does not recognise.
+// The probe's indices answer as the carrier's own first control does, because
+// that is a real control type rather than the zero the stock returns for
+// something it does not recognise.
 
 // The parameter's name, which the probe went without on its first two runs.
 //
-// GetParameterName returns a std::wstring BY VALUE, so the ABI puts a hidden return buffer in
-// rdi and `this` in rsi. Declaring a 24-byte POD return makes the compiler generate exactly
-// that, including the sret pointer coming back in rax. Getting this wrong is not theoretical:
-// the effect-name hooks were pulled from this bridge for reading `this` as a write buffer, and
-// the note on the name record above RenameInstance says so.
+// GetParameterName returns a std::wstring BY VALUE, so the ABI puts a hidden
+// return buffer in rdi and `this` in rsi. Declaring a 24-byte POD return makes
+// the compiler generate exactly that, including the sret pointer coming back in
+// rax. Getting this wrong is not theoretical: the effect-name hooks were pulled
+// from this bridge for reading `this` as a write buffer, and the note on the
+// name record above RenameInstance says so.
 //
-// The string is Resolve's libc++, so it is built with Resolve's own resize rather than by
-// writing the layout from memory - one allocator, no guesses. The stock code does the same
-// thing at 0x4efaa5, and the layout it then reads is the fallback here: bit 0 of the first byte
-// says long, long data at +0x10, short data at +0x04, and a short wstring holds four characters.
+// The string is Resolve's libc++, so it is built with Resolve's own resize
+// rather than by writing the layout from memory - one allocator, no guesses.
+// The stock code does the same thing at 0x4efaa5, and the layout it then reads
+// is the fallback here: bit 0 of the first byte says long, long data at +0x10,
+// short data at +0x04, and a short wstring holds four characters.
 //
-// Why it matters. Run 2 on 2026-08-29 showed Resolve reading all four probe parameters and
-// storing none of them, and the honest reading of that was "not proven": a parameter with no
-// name may be dropped for having no name. This closes that hole before the route is called dead.
+// Why it matters. Run 2 on 2026-08-29 showed Resolve reading all four probe
+// parameters and storing none of them, and the honest reading of that was "not
+// proven": a parameter with no name may be dropped for having no name. This
+// closes that hole before the route is called dead.
 struct BridgeWideString {
-    unsigned long words[3];
+  unsigned long words[3];
 };
 
-void BuildWideString(BridgeWideString& out, const wchar_t* text, size_t length)
-{
-    using ResizeFn = void (*)(void*, size_t, wchar_t);
-    static ResizeFn resize = reinterpret_cast<ResizeFn>(
-        dlsym(RTLD_DEFAULT, "_ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE6resizeEmw"));
+void BuildWideString(BridgeWideString &out, const wchar_t *text,
+                     size_t length) {
+  using ResizeFn = void (*)(void *, size_t, wchar_t);
+  static ResizeFn resize = reinterpret_cast<ResizeFn>(
+      dlsym(RTLD_DEFAULT, "_ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_"
+                          "9allocatorIwEEE6resizeEmw"));
 
-    out.words[0] = 0;
-    out.words[1] = 0;
-    out.words[2] = 0;
-    auto* const bytes = reinterpret_cast<unsigned char*>(&out);
+  out.words[0] = 0;
+  out.words[1] = 0;
+  out.words[2] = 0;
+  auto *const bytes = reinterpret_cast<unsigned char *>(&out);
 
-    if (resize == nullptr) {
-        // No libc++ resize in scope: a short string only, which holds four characters.
-        static bool said = false;
-        if (!said) {
-            said = true;
-            Log("probe: libc++ resize not found - probe names are cut to four characters");
-        }
-        const size_t fit = length < 4 ? length : 4;
-        bytes[0] = static_cast<unsigned char>(fit << 1);
-        std::memcpy(bytes + 4, text, fit * sizeof(wchar_t));
-        return;
+  if (resize == nullptr) {
+    // No libc++ resize in scope: a short string only, which holds four
+    // characters.
+    static bool said = false;
+    if (!said) {
+      said = true;
+      Log("probe: libc++ resize not found - probe names are cut to four "
+          "characters");
     }
+    const size_t fit = length < 4 ? length : 4;
+    bytes[0] = static_cast<unsigned char>(fit << 1);
+    std::memcpy(bytes + 4, text, fit * sizeof(wchar_t));
+    return;
+  }
 
-    resize(&out, length, 0);
-    wchar_t* const data = (bytes[0] & 1u) != 0
-                              ? *reinterpret_cast<wchar_t**>(bytes + 0x10)
-                              : reinterpret_cast<wchar_t*>(bytes + 4);
-    std::memcpy(data, text, length * sizeof(wchar_t));
+  resize(&out, length, 0);
+  wchar_t *const data = (bytes[0] & 1u) != 0
+                            ? *reinterpret_cast<wchar_t **>(bytes + 0x10)
+                            : reinterpret_cast<wchar_t *>(bytes + 4);
+  std::memcpy(data, text, length * sizeof(wchar_t));
 }
 
-BridgeWideString ProbeParameterName(void* self, unsigned int index, void* original)
-{
-    using Fn = BridgeWideString (*)(void*, unsigned int);
-    ClaimedEffect* const effect = FindEffectAny(self);
-    if (effect != nullptr && effect->stock_params != 0 && index >= effect->stock_params &&
-        index < effect->stock_params + kProbeParameters) {
-        const unsigned int slot = index - effect->stock_params;
-        const wchar_t* const names[kProbeParameters] = {L"FXB Probe 0", L"FXB Probe 1",
-                                                        L"FXB Probe 2", L"FXB Probe 3"};
-        BridgeWideString out;
-        BuildWideString(out, names[slot], 11);
-        static std::atomic<int> named{0};
-        if (named.fetch_add(1) < 8) {
-            Log("probe: Resolve asked the name of parameter %u - answering \"FXB Probe %u\"",
-                index, slot);
-        }
-        return out;
+BridgeWideString ProbeParameterName(void *self, unsigned int index,
+                                    void *original) {
+  using Fn = BridgeWideString (*)(void *, unsigned int);
+  ClaimedEffect *const effect = FindEffectAny(self);
+  if (effect != nullptr && effect->stock_params != 0 &&
+      index >= effect->stock_params &&
+      index < effect->stock_params + kProbeParameters) {
+    const unsigned int slot = index - effect->stock_params;
+    const wchar_t *const names[kProbeParameters] = {
+        L"FXB Probe 0", L"FXB Probe 1", L"FXB Probe 2", L"FXB Probe 3"};
+    BridgeWideString out;
+    BuildWideString(out, names[slot], 11);
+    static std::atomic<int> named{0};
+    if (named.fetch_add(1) < 8) {
+      Log("probe: Resolve asked the name of parameter %u - answering \"FXB "
+          "Probe %u\"",
+          index, slot);
     }
-    if (original != nullptr) {
-        return reinterpret_cast<Fn>(original)(self, index);
+    return out;
+  }
+  if (original != nullptr) {
+    return reinterpret_cast<Fn>(original)(self, index);
+  }
+  BridgeWideString empty = {0, 0, 0};
+  return empty;
+}
+
+BridgeWideString BridgeParameterName(void *self, unsigned int index) {
+  return ProbeParameterName(self, index, g_original_parameter_name);
+}
+
+BridgeWideString BridgeParameterNameThunk(void *self, unsigned int index) {
+  return ProbeParameterName(self, index, g_original_parameter_name_thunk);
+}
+
+int ProbeControlType(void *self, int index, void *original) {
+  using Fn = int (*)(void *, int);
+  ClaimedEffect *const effect = FindEffectAny(self);
+  if (effect != nullptr && effect->stock_params != 0 &&
+      index >= static_cast<int>(effect->stock_params) &&
+      index < static_cast<int>(effect->stock_params + kProbeParameters)) {
+    static std::atomic<int> asked{0};
+    if (asked.fetch_add(1) < 8) {
+      Log("probe: Resolve asked the control type of parameter %d - answering "
+          "as its own 0",
+          index);
     }
-    BridgeWideString empty = {0, 0, 0};
-    return empty;
+    return original != nullptr ? reinterpret_cast<Fn>(original)(self, 0) : 0;
+  }
+  return original != nullptr ? reinterpret_cast<Fn>(original)(self, index) : 0;
 }
 
-BridgeWideString BridgeParameterName(void* self, unsigned int index)
-{
-    return ProbeParameterName(self, index, g_original_parameter_name);
+int BridgeControlType(void *self, int index) {
+  return ProbeControlType(self, index, g_original_control_type);
 }
 
-BridgeWideString BridgeParameterNameThunk(void* self, unsigned int index)
-{
-    return ProbeParameterName(self, index, g_original_parameter_name_thunk);
+int BridgeControlTypeThunk(void *self, int index) {
+  return ProbeControlType(self, index, g_original_control_type_thunk);
 }
 
-int ProbeControlType(void* self, int index, void* original)
-{
-    using Fn = int (*)(void*, int);
-    ClaimedEffect* const effect = FindEffectAny(self);
-    if (effect != nullptr && effect->stock_params != 0 &&
-        index >= static_cast<int>(effect->stock_params) &&
-        index < static_cast<int>(effect->stock_params + kProbeParameters)) {
-        static std::atomic<int> asked{0};
-        if (asked.fetch_add(1) < 8) {
-            Log("probe: Resolve asked the control type of parameter %d - answering as its own 0",
-                index);
-        }
-        return original != nullptr ? reinterpret_cast<Fn>(original)(self, 0) : 0;
-    }
-    return original != nullptr ? reinterpret_cast<Fn>(original)(self, index) : 0;
+unsigned long BridgeParameterCount(void *self) {
+  return ProbeParameterCount(self, g_original_parameter_count);
 }
 
-int BridgeControlType(void* self, int index)
-{
-    return ProbeControlType(self, index, g_original_control_type);
+unsigned long BridgeParameterCountThunk(void *self) {
+  return ProbeParameterCount(self, g_original_parameter_count_thunk);
 }
 
-int BridgeControlTypeThunk(void* self, int index)
-{
-    return ProbeControlType(self, index, g_original_control_type_thunk);
+float BridgeParameterValue(void *self, unsigned int index) {
+  return ProbeParameterValue(self, index, g_original_parameter_value);
 }
 
-unsigned long BridgeParameterCount(void* self)
-{
-    return ProbeParameterCount(self, g_original_parameter_count);
+float BridgeParameterValueThunk(void *self, unsigned int index) {
+  return ProbeParameterValue(self, index, g_original_parameter_value_thunk);
 }
 
-unsigned long BridgeParameterCountThunk(void* self)
-{
-    return ProbeParameterCount(self, g_original_parameter_count_thunk);
-}
-
-float BridgeParameterValue(void* self, unsigned int index)
-{
-    return ProbeParameterValue(self, index, g_original_parameter_value);
-}
-
-float BridgeParameterValueThunk(void* self, unsigned int index)
-{
-    return ProbeParameterValue(self, index, g_original_parameter_value_thunk);
-}
-
-// The AudioPlugin-side setter. The primary one at +0x310 already runs through an assembly
-// trampoline, and this is the same call arriving on the other pointer: plain arguments, no
-// float return, so a C++ replacement is enough.
-void BridgeSetParameterThunk(void* self, unsigned int index, float value)
-{
-    ClaimedEffect* const effect = g_param_probe ? FindEffectAny(self) : nullptr;
-    if (effect != nullptr && effect->stock_params != 0 && index >= effect->stock_params &&
-        index < effect->stock_params + kProbeParameters) {
-        const unsigned int slot = index - effect->stock_params;
-        effect->probe[slot] = value;
-        Log("probe: Resolve set parameter %u (probe %u) of \"%s\" to %.6f  [AudioPlugin base]",
-            index, slot, effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
-            static_cast<double>(value));
-    }
-    if (g_original_set_parameter_thunk != nullptr) {
-        reinterpret_cast<void (*)(void*, unsigned int, float)>(
-            g_original_set_parameter_thunk)(self, index, value);
-    }
+// The AudioPlugin-side setter. The primary one at +0x310 already runs through
+// an assembly trampoline, and this is the same call arriving on the other
+// pointer: plain arguments, no float return, so a C++ replacement is enough.
+void BridgeSetParameterThunk(void *self, unsigned int index, float value) {
+  ClaimedEffect *const effect = g_param_probe ? FindEffectAny(self) : nullptr;
+  if (effect != nullptr && effect->stock_params != 0 &&
+      index >= effect->stock_params &&
+      index < effect->stock_params + kProbeParameters) {
+    const unsigned int slot = index - effect->stock_params;
+    effect->probe[slot] = value;
+    Log("probe: Resolve set parameter %u (probe %u) of \"%s\" to %.6f  "
+        "[AudioPlugin base]",
+        index, slot,
+        effect->label_narrow[0] != '\0' ? effect->label_narrow : "an effect",
+        static_cast<double>(value));
+  }
+  if (g_original_set_parameter_thunk != nullptr) {
+    reinterpret_cast<void (*)(void *, unsigned int, float)>(
+        g_original_set_parameter_thunk)(self, index, value);
+  }
 }
 
 // Tells Resolve that the probe's four parameters moved, once per effect.
 //
-// OFF, and it stays off until the listener side is understood. FXBRIDGE_PROBE_NOTIFY=1 arms it.
+// OFF, and it stays off until the listener side is understood.
+// FXBRIDGE_PROBE_NOTIFY=1 arms it.
 //
-// Measured on 2026-08-29, and it cost a project load: with FXBRIDGE_PARAM_PROBE=1 alone Resolve
-// reported the larger count, read probe values 7, 8 and 9 back, and ran on. The moment this
-// class notified those same indices, Resolve was gone before the next line reached the log.
+// Measured on 2026-08-29, and it cost a project load: with
+// FXBRIDGE_PARAM_PROBE=1 alone Resolve reported the larger count, read probe
+// values 7, 8 and 9 back, and ran on. The moment this class notified those same
+// indices, Resolve was gone before the next line reached the log.
 //
-// The reason is in the disassembly, and the earlier reading of it was half a reading. Every
-// indexed accessor inside BMDAudioPluginImpl guards its own vector, which is why over-reporting
-// the count is safe. NotifyParameterUpdate does not stop inside that class: it walks the
-// listener list at this+0x258 and calls each listener with the index - Fairlight's own object,
-// with its own array, sized from a count it took at a moment of its choosing. Nothing in the
+// The reason is in the disassembly, and the earlier reading of it was half a
+// reading. Every indexed accessor inside BMDAudioPluginImpl guards its own
+// vector, which is why over-reporting the count is safe. NotifyParameterUpdate
+// does not stop inside that class: it walks the listener list at this+0x258 and
+// calls each listener with the index - Fairlight's own object, with its own
+// array, sized from a count it took at a moment of its choosing. Nothing in the
 // class we patched guards that array, and nothing here checked it.
 //
-// So notifying an index the carrier does not own is a write into somebody else's model. The
-// route out is not to notify further, it is to make the count true before Fairlight reads it.
+// So notifying an index the carrier does not own is a write into somebody
+// else's model. The route out is not to notify further, it is to make the count
+// true before Fairlight reads it.
 class ProbeNotifier final : public HostMainClient {
 public:
-    void OnHostMainTick() override
-    {
-        if (!g_probe_notify) {
-            return;
-        }
-        if (ticks_ < kTicksBeforeNotify) {
-            ++ticks_;
-            return;
-        }
-        const size_t count = g_effect_count.load();
-        for (size_t index = 0; index < count; ++index) {
-            ClaimedEffect& effect = g_effects[index];
-            if (effect.probe_notified || effect.stock_params == 0 ||
-                effect.primary_base == nullptr || !EffectIsLive(effect)) {
-                continue;
-            }
-            effect.probe_notified = true;
-            if (g_stock_vtable == nullptr) {
-                continue;
-            }
-            using Notify = void (*)(void*, unsigned int);
-            auto* const notify =
-                *reinterpret_cast<Notify*>(g_stock_vtable + kNotifyParameterUpdateOffset);
-            for (unsigned int slot = 0; slot < kProbeParameters; ++slot) {
-                const unsigned int parameter = effect.stock_params + slot;
-                Log("probe: telling Resolve parameter %u of \"%s\" is now %.6f", parameter,
-                    effect.label_narrow[0] != '\0' ? effect.label_narrow : "an effect",
-                    static_cast<double>(effect.probe[slot]));
-                notify(effect.primary_base, parameter);
-            }
-            Log("probe: \"%s\" reported all %u - save the project, quit, and start again",
-                effect.label_narrow[0] != '\0' ? effect.label_narrow : "an effect",
-                kProbeParameters);
-        }
+  void OnHostMainTick() override {
+    if (!g_probe_notify) {
+      return;
     }
+    if (ticks_ < kTicksBeforeNotify) {
+      ++ticks_;
+      return;
+    }
+    const size_t count = g_effect_count.load();
+    for (size_t index = 0; index < count; ++index) {
+      ClaimedEffect &effect = g_effects[index];
+      if (effect.probe_notified || effect.stock_params == 0 ||
+          effect.primary_base == nullptr || !EffectIsLive(effect)) {
+        continue;
+      }
+      effect.probe_notified = true;
+      if (g_stock_vtable == nullptr) {
+        continue;
+      }
+      using Notify = void (*)(void *, unsigned int);
+      auto *const notify = *reinterpret_cast<Notify *>(
+          g_stock_vtable + kNotifyParameterUpdateOffset);
+      for (unsigned int slot = 0; slot < kProbeParameters; ++slot) {
+        const unsigned int parameter = effect.stock_params + slot;
+        Log("probe: telling Resolve parameter %u of \"%s\" is now %.6f",
+            parameter,
+            effect.label_narrow[0] != '\0' ? effect.label_narrow : "an effect",
+            static_cast<double>(effect.probe[slot]));
+        notify(effect.primary_base, parameter);
+      }
+      Log("probe: \"%s\" reported all %u - save the project, quit, and start "
+          "again",
+          effect.label_narrow[0] != '\0' ? effect.label_narrow : "an effect",
+          kProbeParameters);
+    }
+  }
 
 private:
-    static constexpr int kTicksBeforeNotify = 300;  // the tick is 16 ms, so about five seconds
-    int ticks_ = 0;
+  static constexpr int kTicksBeforeNotify =
+      300; // the tick is 16 ms, so about five seconds
+  int ticks_ = 0;
 };
 
 ProbeNotifier g_probe_notifier;
 
-
 // ---------------------------------------------------------------------------
 // The preset channel, watched on the slots Resolve really dials.
 //
-// An earlier session traced StorePreset and LoadPreset, saw zero calls across a full session
-// with project saves, and concluded from that silence that the preset is not how Resolve stores
-// an effect. That conclusion is retracted here: the trace was on +0x380 and +0x388, which are
-// the PRIMARY vtable slots, and Resolve holds an AudioPlugin* - so it calls the thunks at +0x990
-// and +0x998. The silence was our own microphone pointed at the wrong slot.
+// An earlier session traced StorePreset and LoadPreset, saw zero calls across a
+// full session with project saves, and concluded from that silence that the
+// preset is not how Resolve stores an effect. That conclusion is retracted
+// here: the trace was on +0x380 and +0x388, which are the PRIMARY vtable slots,
+// and Resolve holds an AudioPlugin* - so it calls the thunks at +0x990 and
+// +0x998. The silence was our own microphone pointed at the wrong slot.
 //
-// What the offsets are, worked out from the VST host rather than assumed. VSTPlugin in
-// libFairlightPage.so is a complete VST2 host - 198 symbols, StorePreset, LoadPreset, IsWaveShell
-// - so Resolve on Linux does host VSTs and does keep their state. In its vtable the second group's
-// vptr is at symbol+0x238 and its StorePreset thunk at symbol+0x578, so Resolve's call site reads
-// vptr+0x340. EffectsController::SaveEffectPreset has exactly that call at 0x14ac5fa, and treats
-// a false return as "nothing to save":
+// What the offsets are, worked out from the VST host rather than assumed.
+// VSTPlugin in libFairlightPage.so is a complete VST2 host - 198 symbols,
+// StorePreset, LoadPreset, IsWaveShell
+// - so Resolve on Linux does host VSTs and does keep their state. In its vtable
+// the second group's vptr is at symbol+0x238 and its StorePreset thunk at
+// symbol+0x578, so Resolve's call site reads vptr+0x340.
+// EffectsController::SaveEffectPreset has exactly that call at 0x14ac5fa, and
+// treats a false return as "nothing to save":
 //
 //     14ac5fa:  call *0x340(%rax)      # StorePreset(preset)
 //     14ac600:  test %al,%al
 //     14ac602:  je   <bail out>
 //
-// Applying the same base to the carrier gives 0x990 - 0x340 = 0x650, which is its AudioPlugin
-// group; HasEditor checks out at the same base (0x718 - 0x0c8 = 0x650).
+// Applying the same base to the carrier gives 0x990 - 0x340 = 0x650, which is
+// its AudioPlugin group; HasEditor checks out at the same base (0x718 - 0x0c8 =
+// 0x650).
 //
-// This hook only watches and forwards. What the preset object looks like is the next question,
-// and it is answered by reading one that Resolve fills, not by guessing at it.
+// This hook only watches and forwards. What the preset object looks like is the
+// next question, and it is answered by reading one that Resolve fills, not by
+// guessing at it.
 // ---------------------------------------------------------------------------
 
 constexpr size_t kStorePresetThunkOffset = 0x990;
 constexpr size_t kLoadPresetThunkOffset = 0x998;
 
-void* g_original_store_preset = nullptr;
-void* g_original_load_preset = nullptr;
+void *g_original_store_preset = nullptr;
+void *g_original_load_preset = nullptr;
 
 // The payload the preset carries, read rather than guessed at.
 //
-// The first two words of an AudioPluginPreset are a pointer and a length - 0x2ac bytes for one
-// effect, 0x3bc for another - which is the shape of a variable-size blob. What is inside it
-// decides whether a hosted plugin's own chunk can travel the same way, so it is dumped as bytes
-// and as text side by side.
-void LogPresetPayload(const char* label, const void* preset)
-{
-    if (preset == nullptr) {
-        return;
+// The first two words of an AudioPluginPreset are a pointer and a length -
+// 0x2ac bytes for one effect, 0x3bc for another - which is the shape of a
+// variable-size blob. What is inside it decides whether a hosted plugin's own
+// chunk can travel the same way, so it is dumped as bytes and as text side by
+// side.
+[[maybe_unused]] void LogPresetPayload(const char *label, const void *preset) {
+  if (preset == nullptr) {
+    return;
+  }
+  unsigned long header[2] = {0, 0};
+  if (!SafeRead(preset, header, sizeof(header))) {
+    return;
+  }
+  const auto *const data = reinterpret_cast<const unsigned char *>(header[0]);
+  const unsigned long length = header[1];
+  Log("%s payload %lu bytes at %p", label, length,
+      static_cast<const void *>(data));
+  if (data == nullptr || length == 0) {
+    return;
+  }
+  const unsigned long shown = length < 160 ? length : 160;
+  for (unsigned long at = 0; at < shown; at += 16) {
+    unsigned char row[16] = {0};
+    const unsigned long take = (shown - at) < 16 ? (shown - at) : 16;
+    if (!SafeRead(data + at, row, take)) {
+      return;
     }
-    unsigned long header[2] = {0, 0};
-    if (!SafeRead(preset, header, sizeof(header))) {
-        return;
+    char line[120];
+    int written = std::snprintf(line, sizeof(line), "%s %04lx  ", label, at);
+    for (unsigned long column = 0; column < 16; ++column) {
+      written += std::snprintf(line + written, sizeof(line) - written,
+                               column < take ? "%02x " : "   ",
+                               column < take ? row[column] : 0);
     }
-    const auto* const data = reinterpret_cast<const unsigned char*>(header[0]);
-    const unsigned long length = header[1];
-    Log("%s payload %lu bytes at %p", label, length, static_cast<const void*>(data));
-    if (data == nullptr || length == 0) {
-        return;
+    written += std::snprintf(line + written, sizeof(line) - written, " ");
+    for (unsigned long column = 0; column < take; ++column) {
+      const unsigned char byte = row[column];
+      written += std::snprintf(line + written, sizeof(line) - written, "%c",
+                               byte >= 0x20 && byte < 0x7f ? byte : '.');
     }
-    const unsigned long shown = length < 160 ? length : 160;
-    for (unsigned long at = 0; at < shown; at += 16) {
-        unsigned char row[16] = {0};
-        const unsigned long take = (shown - at) < 16 ? (shown - at) : 16;
-        if (!SafeRead(data + at, row, take)) {
-            return;
-        }
-        char line[120];
-        int written = std::snprintf(line, sizeof(line), "%s %04lx  ", label, at);
-        for (unsigned long column = 0; column < 16; ++column) {
-            written += std::snprintf(line + written, sizeof(line) - written,
-                                     column < take ? "%02x " : "   ",
-                                     column < take ? row[column] : 0);
-        }
-        written += std::snprintf(line + written, sizeof(line) - written, " ");
-        for (unsigned long column = 0; column < take; ++column) {
-            const unsigned char byte = row[column];
-            written += std::snprintf(line + written, sizeof(line) - written, "%c",
-                                     byte >= 0x20 && byte < 0x7f ? byte : '.');
-        }
-        Log("%s", line);
-    }
+    Log("%s", line);
+  }
 }
 
 // The payload is a parameter table, so read it as one.
@@ -3873,712 +4361,788 @@ void LogPresetPayload(const char* label, const void* preset)
 //
 //     +0x00  int    version, 3 here
 //     +0x04  int    how many parameters follow
-//     +0x08  char[64]  the preset's name, "__DEFAULT__" for the one a project carries
-//     then, per parameter: char[64] name, then a float
+//     +0x08  char[64]  the preset's name, "__DEFAULT__" for the one a project
+//     carries then, per parameter: char[64] name, then a float
 //
-// The first float read back this way was 0.305426, which is exactly what the knob hook had
-// logged for index 0 of that effect. The names are qualified - "StereoDelay::HP_FREQ" - which
-// says the table is keyed by name rather than by position.
-void LogPresetTable(const char* label, const void* preset)
-{
-    if (preset == nullptr) {
-        return;
+// The first float read back this way was 0.305426, which is exactly what the
+// knob hook had logged for index 0 of that effect. The names are qualified -
+// "StereoDelay::HP_FREQ" - which says the table is keyed by name rather than by
+// position.
+void LogPresetTable(const char *label, const void *preset) {
+  if (preset == nullptr) {
+    return;
+  }
+  unsigned long header[2] = {0, 0};
+  if (!SafeRead(preset, header, sizeof(header))) {
+    return;
+  }
+  const auto *const data = reinterpret_cast<const unsigned char *>(header[0]);
+  const unsigned long length = header[1];
+  if (data == nullptr || length < 72) {
+    return;
+  }
+  int version = 0;
+  int count = 0;
+  char name[65] = {0};
+  if (!SafeRead(data, &version, sizeof(version)) ||
+      !SafeRead(data + 4, &count, sizeof(count)) ||
+      !SafeRead(data + 8, name, 64)) {
+    return;
+  }
+  name[64] = '\0';
+  Log("%s table: version %d, %d parameters, preset \"%s\", %lu bytes", label,
+      version, count, name, length);
+  // Hard cap on the lines this writes.
+  //
+  // LoadPreset runs on Resolve's own thread while the project loads, and every
+  // Log here is an fprintf plus an fflush into Resolve's log pipe. A table of
+  // any size would put hundreds of synchronous writes on the thread that is
+  // loading the project. Resolve hung once on 2026-08-29 with an uncapped
+  // version of this in place; that was never traced to this code and may have
+  // been unrelated, but an uncapped log on a loading thread is not worth
+  // keeping either way.
+  if (count < 0 || count > 512) {
+    return;
+  }
+  const int shown = count < 16 ? count : 16;
+  for (int index = 0; index < shown; ++index) {
+    const unsigned long at = 72 + static_cast<unsigned long>(index) * 68;
+    if (at + 68 > length) {
+      Log("%s table: entry %d runs past the %lu bytes - stopping", label, index,
+          length);
+      return;
     }
-    unsigned long header[2] = {0, 0};
-    if (!SafeRead(preset, header, sizeof(header))) {
-        return;
+    char field[65] = {0};
+    float value = 0.0f;
+    if (!SafeRead(data + at, field, 64) ||
+        !SafeRead(data + at + 64, &value, sizeof(value))) {
+      return;
     }
-    const auto* const data = reinterpret_cast<const unsigned char*>(header[0]);
-    const unsigned long length = header[1];
-    if (data == nullptr || length < 72) {
-        return;
-    }
-    int version = 0;
-    int count = 0;
-    char name[65] = {0};
-    if (!SafeRead(data, &version, sizeof(version)) ||
-        !SafeRead(data + 4, &count, sizeof(count)) || !SafeRead(data + 8, name, 64)) {
-        return;
-    }
-    name[64] = '\0';
-    Log("%s table: version %d, %d parameters, preset \"%s\", %lu bytes", label, version, count,
-        name, length);
-    // Hard cap on the lines this writes.
-    //
-    // LoadPreset runs on Resolve's own thread while the project loads, and every Log here is an
-    // fprintf plus an fflush into Resolve's log pipe. A table of any size would put hundreds of
-    // synchronous writes on the thread that is loading the project. Resolve hung once on
-    // 2026-08-29 with an uncapped version of this in place; that was never traced to this code
-    // and may have been unrelated, but an uncapped log on a loading thread is not worth keeping
-    // either way.
-    if (count < 0 || count > 512) {
-        return;
-    }
-    const int shown = count < 16 ? count : 16;
-    for (int index = 0; index < shown; ++index) {
-        const unsigned long at = 72 + static_cast<unsigned long>(index) * 68;
-        if (at + 68 > length) {
-            Log("%s table: entry %d runs past the %lu bytes - stopping", label, index, length);
-            return;
-        }
-        char field[65] = {0};
-        float value = 0.0f;
-        if (!SafeRead(data + at, field, 64) || !SafeRead(data + at + 64, &value, sizeof(value))) {
-            return;
-        }
-        field[64] = '\0';
-        Log("%s table:   [%2d] %-40s %.6f", label, index, field, static_cast<double>(value));
-    }
-    if (shown < count) {
-        Log("%s table:   ... and %d more, not logged", label, count - shown);
-    }
+    field[64] = '\0';
+    Log("%s table:   [%2d] %-40s %.6f", label, index, field,
+        static_cast<double>(value));
+  }
+  if (shown < count) {
+    Log("%s table:   ... and %d more, not logged", label, count - shown);
+  }
 }
 
-void LogPresetWords(const char* label, const void* preset)
-{
-    if (preset == nullptr) {
-        return;
+void LogPresetWords(const char *label, const void *preset) {
+  if (preset == nullptr) {
+    return;
+  }
+  for (int row = 0; row < 4; ++row) {
+    unsigned long words[4] = {0, 0, 0, 0};
+    if (!SafeRead(static_cast<const unsigned char *>(preset) + row * 32, words,
+                  sizeof(words))) {
+      return;
     }
-    for (int row = 0; row < 4; ++row) {
-        unsigned long words[4] = {0, 0, 0, 0};
-        if (!SafeRead(static_cast<const unsigned char*>(preset) + row * 32, words, sizeof(words))) {
-            return;
-        }
-        Log("%s +0x%02x  %016lx %016lx %016lx %016lx", label, row * 32, words[0], words[1],
-            words[2], words[3]);
-    }
+    Log("%s +0x%02x  %016lx %016lx %016lx %016lx", label, row * 32, words[0],
+        words[1], words[2], words[3]);
+  }
 }
 
 // ---------------------------------------------------------------------------
 // The plugin's own settings, carried inside Resolve's preset
 //
 // Resolve's own VST host already does this, and the format allows it.
-// VSTPlugin::StorePreset picks between two payload shapes on one AEffect flag: a parameter table
-// when the plugin has no chunk, and the plugin's opaque chunk when it has one. Both travel in the
-// same two fields of AudioPluginPreset - the pointer at +0x00 and the length at +0x08 - with a
-// type tag at +0x10 saying which shape it is: 0 for VST parameters, 1 for a VST chunk, 2 for a
-// Blackmagic effect. EffectPresetHeader2 copies that length and that tag into the serialised
-// header, and LoadAudioPluginPreset copies both back and reallocates the buffer, so an opaque blob
-// round-trips through a project file. The length is a uint32 on the way through, which puts the
-// ceiling at 4 GiB rather than anywhere near a plugin's chunk.
+// VSTPlugin::StorePreset picks between two payload shapes on one AEffect flag:
+// a parameter table when the plugin has no chunk, and the plugin's opaque chunk
+// when it has one. Both travel in the same two fields of AudioPluginPreset -
+// the pointer at +0x00 and the length at +0x08 - with a type tag at +0x10
+// saying which shape it is: 0 for VST parameters, 1 for a VST chunk, 2 for a
+// Blackmagic effect. EffectPresetHeader2 copies that length and that tag into
+// the serialised header, and LoadAudioPluginPreset copies both back and
+// reallocates the buffer, so an opaque blob round-trips through a project file.
+// The length is a uint32 on the way through, which puts the ceiling at 4 GiB
+// rather than anywhere near a plugin's chunk.
 //
-// We do not claim the tag. BMDAudioPluginImpl::LoadPreset never reads it - it checks only that the
-// pointer is not null, the length is not zero, and the first word of the buffer is at least 2 - so
-// setting it would gain nothing and might confuse code we have not read. The carrier's payload is
-// left exactly as it is and the chunk is appended behind a footer:
+// We do not claim the tag. BMDAudioPluginImpl::LoadPreset never reads it - it
+// checks only that the pointer is not null, the length is not zero, and the
+// first word of the buffer is at least 2 - so setting it would gain nothing and
+// might confuse code we have not read. The carrier's payload is left exactly as
+// it is and the chunk is appended behind a footer:
 //
-//     [ the carrier's own payload ][ our chunk ][ uint64 chunk length ][ 8-byte magic ]
+//     [ the carrier's own payload ][ our chunk ][ uint64 chunk length ][ 8-byte
+//     magic ]
 //
-// On the way back in the length is temporarily set to the carrier's own, so the stock parser sees
-// the buffer it wrote and nothing else, and restored afterwards. That removes the one thing this
-// design would otherwise rest on: whether the stock parser tolerates bytes after its table.
+// On the way back in the length is temporarily set to the carrier's own, so the
+// stock parser sees the buffer it wrote and nothing else, and restored
+// afterwards. That removes the one thing this design would otherwise rest on:
+// whether the stock parser tolerates bytes after its table.
 // ---------------------------------------------------------------------------
 
-// Set from FXBRIDGE_PRESET_STATE. Off leaves both hooks forwarding and logging, as they were.
+// Set from FXBRIDGE_PRESET_STATE. Off leaves both hooks forwarding and logging,
+// as they were.
 bool g_preset_state = false;
 
-// The footer, in two versions. Version 1 was written for one afternoon and is still read, because
-// a project saved with it holds real settings and discarding them to tidy up a format would be a
-// poor trade. Version 2 adds the stamp that decides between this and the file store.
+// The footer, in two versions. Version 1 was written for one afternoon and is
+// still read, because a project saved with it holds real settings and
+// discarding them to tidy up a format would be a poor trade. Version 2 adds the
+// stamp that decides between this and the file store.
 //
 //   v1:  [ carrier ][ chunk ][ uint64 length ][ "FXBRIDG1" ]
 //   v2:  [ carrier ][ chunk ][ uint64 stamp  ][ uint64 length ][ "FXBRIDG2" ]
 //
-// The length always sits in the eight bytes before the magic, so one reader handles both.
+// The length always sits in the eight bytes before the magic, so one reader
+// handles both.
 const char kChunkMagicV1[8] = {'F', 'X', 'B', 'R', 'I', 'D', 'G', '1'};
 const char kChunkMagicV2[8] = {'F', 'X', 'B', 'R', 'I', 'D', 'G', '2'};
 constexpr size_t kChunkFooterV1 = 2 * sizeof(uint64_t);
 constexpr size_t kChunkFooterV2 = 3 * sizeof(uint64_t);
 
-using ArrayNewFn = void* (*)(size_t);
-using ArrayDeleteFn = void (*)(void*);
+using ArrayNewFn = void *(*)(size_t);
+using ArrayDeleteFn = void (*)(void *);
 ArrayNewFn g_array_new = nullptr;
 ArrayDeleteFn g_array_delete = nullptr;
 
-// Resolve allocated the payload with operator new[] and frees it with operator delete[], so the
-// replacement has to come from that same pair. Both are looked up by name rather than called
-// through our own new[]: this process has two C++ runtimes in it, and the pair Resolve's PLT binds
-// to is whichever the dynamic linker finds first - which is exactly what RTLD_DEFAULT returns.
-// Guessing wrong here frees a pointer on the wrong heap.
-void ResolveArrayAllocator()
-{
-    g_array_new = reinterpret_cast<ArrayNewFn>(dlsym(RTLD_DEFAULT, "_Znam"));
-    g_array_delete = reinterpret_cast<ArrayDeleteFn>(dlsym(RTLD_DEFAULT, "_ZdaPv"));
-    Log("preset: operator new[] at %p, operator delete[] at %p",
-        reinterpret_cast<void*>(g_array_new), reinterpret_cast<void*>(g_array_delete));
+// Resolve allocated the payload with operator new[] and frees it with operator
+// delete[], so the replacement has to come from that same pair. Both are looked
+// up by name rather than called through our own new[]: this process has two C++
+// runtimes in it, and the pair Resolve's PLT binds to is whichever the dynamic
+// linker finds first - which is exactly what RTLD_DEFAULT returns. Guessing
+// wrong here frees a pointer on the wrong heap.
+void ResolveArrayAllocator() {
+  g_array_new = reinterpret_cast<ArrayNewFn>(dlsym(RTLD_DEFAULT, "_Znam"));
+  g_array_delete =
+      reinterpret_cast<ArrayDeleteFn>(dlsym(RTLD_DEFAULT, "_ZdaPv"));
+  Log("preset: operator new[] at %p, operator delete[] at %p",
+      reinterpret_cast<void *>(g_array_new),
+      reinterpret_cast<void *>(g_array_delete));
 }
 
-// Reads the footer at the end of a payload. Answers true only for a footer we wrote, and fills in
-// where the carrier's own bytes end and how long the chunk behind them is.
-bool FindAttachedChunk(const unsigned char* data, size_t length, size_t* carrier_length,
-                       size_t* chunk_length, uint64_t* stamp)
-{
-    if (stamp != nullptr) {
-        *stamp = 0;
+// Reads the footer at the end of a payload. Answers true only for a footer we
+// wrote, and fills in where the carrier's own bytes end and how long the chunk
+// behind them is.
+bool FindAttachedChunk(const unsigned char *data, size_t length,
+                       size_t *carrier_length, size_t *chunk_length,
+                       uint64_t *stamp) {
+  if (stamp != nullptr) {
+    *stamp = 0;
+  }
+  if (data == nullptr || length < kChunkFooterV1) {
+    return false;
+  }
+  char magic[8] = {0};
+  if (!SafeRead(data + length - sizeof(magic), magic, sizeof(magic))) {
+    return false;
+  }
+  size_t footer = 0;
+  if (std::memcmp(magic, kChunkMagicV2, sizeof(magic)) == 0) {
+    footer = kChunkFooterV2;
+  } else if (std::memcmp(magic, kChunkMagicV1, sizeof(magic)) == 0) {
+    footer = kChunkFooterV1;
+  } else {
+    return false;
+  }
+  if (length < footer) {
+    return false;
+  }
+  uint64_t stated = 0;
+  if (!SafeRead(data + length - 2 * sizeof(uint64_t), &stated,
+                sizeof(stated))) {
+    return false;
+  }
+  if (stated > length - footer) {
+    return false;
+  }
+  if (footer == kChunkFooterV2 && stamp != nullptr &&
+      !SafeRead(data + length - footer, stamp, sizeof(*stamp))) {
+    return false;
+  }
+  *chunk_length = static_cast<size_t>(stated);
+  *carrier_length = length - footer - *chunk_length;
+  return true;
+}
+
+// Appends this effect's plugin state to the payload the stock StorePreset just
+// wrote.
+void AttachPluginChunk(ClaimedEffect *effect, void *preset) {
+  // A low cap made this unobservable: two saves filled it, and after that a
+  // session could not be asked whether a save had happened at all.
+  static std::atomic<int> said{0};
+  const bool talk = said.fetch_add(1) < 256;
+  if (!g_preset_state || preset == nullptr || effect == nullptr ||
+      effect->plugin == nullptr) {
+    return;
+  }
+  if (g_array_new == nullptr || g_array_delete == nullptr) {
+    if (talk) {
+      Log("preset: no operator new[] - \"%s\" not attached",
+          effect->label_narrow);
     }
-    if (data == nullptr || length < kChunkFooterV1) {
-        return false;
+    return;
+  }
+
+  std::vector<uint8_t> blob;
+  if (!effect->plugin->SaveState(blob) || blob.empty()) {
+    if (talk) {
+      Log("preset: \"%s\" reported no settings - nothing attached",
+          effect->label_narrow);
     }
-    char magic[8] = {0};
-    if (!SafeRead(data + length - sizeof(magic), magic, sizeof(magic))) {
-        return false;
+    return;
+  }
+
+  unsigned long header[2] = {0, 0};
+  if (!SafeRead(preset, header, sizeof(header))) {
+    if (talk) {
+      Log("preset: cannot read the payload of \"%s\"", effect->label_narrow);
     }
-    size_t footer = 0;
-    if (std::memcmp(magic, kChunkMagicV2, sizeof(magic)) == 0) {
-        footer = kChunkFooterV2;
-    } else if (std::memcmp(magic, kChunkMagicV1, sizeof(magic)) == 0) {
-        footer = kChunkFooterV1;
-    } else {
-        return false;
+    return;
+  }
+  auto *const stock = reinterpret_cast<unsigned char *>(header[0]);
+  const size_t stock_length = static_cast<size_t>(header[1]);
+  if (stock == nullptr || stock_length == 0) {
+    if (talk) {
+      Log("preset: \"%s\" has an empty payload - nothing to append to",
+          effect->label_narrow);
     }
-    if (length < footer) {
-        return false;
+    return;
+  }
+
+  // A preset object can arrive already carrying one of ours. Replace that tail,
+  // never stack a second one behind it.
+  size_t carrier_length = stock_length;
+  size_t previous = 0;
+  if (FindAttachedChunk(stock, stock_length, &carrier_length, &previous,
+                        nullptr) &&
+      talk) {
+    Log("preset: \"%s\" already carried %zu bytes - replacing them",
+        effect->label_narrow, previous);
+  }
+
+  const size_t total = carrier_length + blob.size() + kChunkFooterV2;
+  unsigned char *fresh = nullptr;
+  try {
+    fresh = static_cast<unsigned char *>(g_array_new(total));
+  } catch (...) {
+    fresh = nullptr;
+  }
+  if (fresh == nullptr) {
+    Log("preset: could not allocate %zu bytes for \"%s\" - not attached", total,
+        effect->label_narrow);
+    return;
+  }
+
+  const uint64_t stamp = static_cast<uint64_t>(std::time(nullptr));
+  const uint64_t stated = blob.size();
+  unsigned char *tail = fresh;
+  std::memcpy(tail, stock, carrier_length);
+  tail += carrier_length;
+  std::memcpy(tail, blob.data(), blob.size());
+  tail += blob.size();
+  std::memcpy(tail, &stamp, sizeof(stamp));
+  tail += sizeof(stamp);
+  std::memcpy(tail, &stated, sizeof(stated));
+  tail += sizeof(stated);
+  std::memcpy(tail, kChunkMagicV2, sizeof(kChunkMagicV2));
+  effect->state_stamp = stamp;
+
+  auto *const words = static_cast<unsigned long *>(preset);
+  words[0] = reinterpret_cast<unsigned long>(fresh);
+  words[1] = static_cast<unsigned long>(total);
+  g_array_delete(stock);
+
+  if (talk) {
+    Log("preset: attached %zu bytes of \"%s\" behind %zu carrier bytes (%zu "
+        "total)",
+        blob.size(), effect->label_narrow, carrier_length, total);
+  }
+}
+
+// Hands the plugin back what the project carried for it. Answers the carrier's
+// own length when the payload holds a chunk, so the stock parser can be shown
+// the buffer it wrote and nothing more.
+bool TakeAttachedChunk(ClaimedEffect *effect, void *preset,
+                       size_t *carrier_length) {
+  static std::atomic<int> said{0};
+  const bool talk = said.fetch_add(1) < 256;
+  if (!g_preset_state || preset == nullptr) {
+    return false;
+  }
+  unsigned long header[2] = {0, 0};
+  if (!SafeRead(preset, header, sizeof(header))) {
+    return false;
+  }
+  auto *const data = reinterpret_cast<const unsigned char *>(header[0]);
+  const size_t length = static_cast<size_t>(header[1]);
+  size_t chunk_length = 0;
+  uint64_t stamp = 0;
+  if (!FindAttachedChunk(data, length, carrier_length, &chunk_length, &stamp)) {
+    return false;
+  }
+  if (effect == nullptr || effect->plugin == nullptr) {
+    if (talk) {
+      Log("preset: the project carried %zu bytes, but this effect has no "
+          "plugin yet",
+          chunk_length);
     }
-    uint64_t stated = 0;
-    if (!SafeRead(data + length - 2 * sizeof(uint64_t), &stated, sizeof(stated))) {
-        return false;
-    }
-    if (stated > length - footer) {
-        return false;
-    }
-    if (footer == kChunkFooterV2 && stamp != nullptr &&
-        !SafeRead(data + length - footer, stamp, sizeof(*stamp))) {
-        return false;
-    }
-    *chunk_length = static_cast<size_t>(stated);
-    *carrier_length = length - footer - *chunk_length;
     return true;
-}
+  }
 
-// Appends this effect's plugin state to the payload the stock StorePreset just wrote.
-void AttachPluginChunk(ClaimedEffect* effect, void* preset)
-{
-    // A low cap made this unobservable: two saves filled it, and after that a session could not
-    // be asked whether a save had happened at all.
-    static std::atomic<int> said{0};
-    const bool talk = said.fetch_add(1) < 256;
-    if (!g_preset_state || preset == nullptr || effect == nullptr || effect->plugin == nullptr) {
-        return;
+  // The file store may already have restored something newer. That is the whole
+  // reason it is still here: Resolve serialises the effects model only when the
+  // PROJECT is modified, and an edit inside a hosted plugin's window is not a
+  // project modification. Refusing to overwrite newer settings with older ones
+  // is what makes the two stores safe to run together. A stamp of zero means
+  // the project's chunk predates the stamped footer, not that it is old.
+  // Treating "unknown" as "oldest" made the file store win every comparison and
+  // load settings from an earlier session over the ones the project actually
+  // held - measured, and it cost a restart. Unknown means the project wins: it
+  // is the store with real per-instance identity, and the file store is the
+  // fallback.
+  if (stamp != 0 && effect->state_stamp != 0 && stamp < effect->state_stamp) {
+    if (talk) {
+      Log("preset: the project's %zu bytes for \"%s\" are older than the saved "
+          "file - kept "
+          "the file",
+          chunk_length, effect->label_narrow);
     }
-    if (g_array_new == nullptr || g_array_delete == nullptr) {
-        if (talk) { Log("preset: no operator new[] - \"%s\" not attached", effect->label_narrow); }
-        return;
-    }
+    return true;
+  }
 
-    std::vector<uint8_t> blob;
-    if (!effect->plugin->SaveState(blob) || blob.empty()) {
-        if (talk) {
-            Log("preset: \"%s\" reported no settings - nothing attached", effect->label_narrow);
-        }
-        return;
-    }
-
-    unsigned long header[2] = {0, 0};
-    if (!SafeRead(preset, header, sizeof(header))) {
-        if (talk) { Log("preset: cannot read the payload of \"%s\"", effect->label_narrow); }
-        return;
-    }
-    auto* const stock = reinterpret_cast<unsigned char*>(header[0]);
-    const size_t stock_length = static_cast<size_t>(header[1]);
-    if (stock == nullptr || stock_length == 0) {
-        if (talk) {
-            Log("preset: \"%s\" has an empty payload - nothing to append to",
-                effect->label_narrow);
-        }
-        return;
-    }
-
-    // A preset object can arrive already carrying one of ours. Replace that tail, never stack a
-    // second one behind it.
-    size_t carrier_length = stock_length;
-    size_t previous = 0;
-    if (FindAttachedChunk(stock, stock_length, &carrier_length, &previous, nullptr) && talk) {
-        Log("preset: \"%s\" already carried %zu bytes - replacing them", effect->label_narrow,
-            previous);
-    }
-
-    const size_t total = carrier_length + blob.size() + kChunkFooterV2;
-    unsigned char* fresh = nullptr;
-    try {
-        fresh = static_cast<unsigned char*>(g_array_new(total));
-    } catch (...) {
-        fresh = nullptr;
-    }
-    if (fresh == nullptr) {
-        Log("preset: could not allocate %zu bytes for \"%s\" - not attached", total,
-            effect->label_narrow);
-        return;
-    }
-
-    const uint64_t stamp = static_cast<uint64_t>(std::time(nullptr));
-    const uint64_t stated = blob.size();
-    unsigned char* tail = fresh;
-    std::memcpy(tail, stock, carrier_length);
-    tail += carrier_length;
-    std::memcpy(tail, blob.data(), blob.size());
-    tail += blob.size();
-    std::memcpy(tail, &stamp, sizeof(stamp));
-    tail += sizeof(stamp);
-    std::memcpy(tail, &stated, sizeof(stated));
-    tail += sizeof(stated);
-    std::memcpy(tail, kChunkMagicV2, sizeof(kChunkMagicV2));
+  const bool took =
+      chunk_length != 0 &&
+      effect->plugin->LoadState(data + *carrier_length, chunk_length);
+  if (took) {
     effect->state_stamp = stamp;
-
-    auto* const words = static_cast<unsigned long*>(preset);
-    words[0] = reinterpret_cast<unsigned long>(fresh);
-    words[1] = static_cast<unsigned long>(total);
-    g_array_delete(stock);
-
-    if (talk) {
-        Log("preset: attached %zu bytes of \"%s\" behind %zu carrier bytes (%zu total)",
-            blob.size(), effect->label_narrow, carrier_length, total);
-    }
+  }
+  if (talk) {
+    Log("preset: the project carried %zu bytes for \"%s\" - %s", chunk_length,
+        effect->label_narrow, took ? "restored" : "REFUSED by the plugin");
+  }
+  return true;
 }
 
-// Hands the plugin back what the project carried for it. Answers the carrier's own length when the
-// payload holds a chunk, so the stock parser can be shown the buffer it wrote and nothing more.
-bool TakeAttachedChunk(ClaimedEffect* effect, void* preset, size_t* carrier_length)
-{
-    static std::atomic<int> said{0};
-    const bool talk = said.fetch_add(1) < 256;
-    if (!g_preset_state || preset == nullptr) {
-        return false;
+bool BridgeStorePreset(void *self, void *preset) {
+  static std::atomic<int> seen{0};
+  const int index = seen.fetch_add(1);
+  ClaimedEffect *const effect = FindEffectAny(self);
+  if (index < 256) {
+    Log("preset: StorePreset on \"%s\" (preset at %p)",
+        effect != nullptr && effect->label_narrow[0] != '\0'
+            ? effect->label_narrow
+            : "an effect",
+        preset);
+  }
+  bool answered = false;
+  if (g_original_store_preset != nullptr) {
+    answered = reinterpret_cast<bool (*)(void *, void *)>(
+        g_original_store_preset)(self, preset);
+  }
+  if (index < 256) {
+    Log("preset: StorePreset returned %s", answered ? "true" : "false");
+    if (index < 8) {
+      LogPresetWords("preset: store", preset);
     }
-    unsigned long header[2] = {0, 0};
-    if (!SafeRead(preset, header, sizeof(header))) {
-        return false;
+    if (index < 2) {
+      LogPresetTable("preset: store", preset);
     }
-    auto* const data = reinterpret_cast<const unsigned char*>(header[0]);
-    const size_t length = static_cast<size_t>(header[1]);
-    size_t chunk_length = 0;
-    uint64_t stamp = 0;
-    if (!FindAttachedChunk(data, length, carrier_length, &chunk_length, &stamp)) {
-        return false;
-    }
-    if (effect == nullptr || effect->plugin == nullptr) {
-        if (talk) {
-            Log("preset: the project carried %zu bytes, but this effect has no plugin yet",
-                chunk_length);
-        }
-        return true;
-    }
-
-    // The file store may already have restored something newer. That is the whole reason it is
-    // still here: Resolve serialises the effects model only when the PROJECT is modified, and an
-    // edit inside a hosted plugin's window is not a project modification. Refusing to overwrite
-    // newer settings with older ones is what makes the two stores safe to run together.
-    // A stamp of zero means the project's chunk predates the stamped footer, not that it is old.
-    // Treating "unknown" as "oldest" made the file store win every comparison and load settings
-    // from an earlier session over the ones the project actually held - measured, and it cost a
-    // restart. Unknown means the project wins: it is the store with real per-instance identity,
-    // and the file store is the fallback.
-    if (stamp != 0 && effect->state_stamp != 0 && stamp < effect->state_stamp) {
-        if (talk) {
-            Log("preset: the project's %zu bytes for \"%s\" are older than the saved file - kept "
-                "the file",
-                chunk_length, effect->label_narrow);
-        }
-        return true;
-    }
-
-    const bool took = chunk_length != 0 &&
-                      effect->plugin->LoadState(data + *carrier_length, chunk_length);
-    if (took) {
-        effect->state_stamp = stamp;
-    }
-    if (talk) {
-        Log("preset: the project carried %zu bytes for \"%s\" - %s", chunk_length,
-            effect->label_narrow, took ? "restored" : "REFUSED by the plugin");
-    }
-    return true;
+  }
+  // Only when the carrier wrote a payload of its own. A false answer means
+  // Resolve is about to skip this effect, and appending to a buffer nobody
+  // reads would be a leak with a log line.
+  if (answered) {
+    AttachPluginChunk(effect, preset);
+  }
+  return answered;
 }
 
-bool BridgeStorePreset(void* self, void* preset)
-{
-    static std::atomic<int> seen{0};
-    const int index = seen.fetch_add(1);
-    ClaimedEffect* const effect = FindEffectAny(self);
-    if (index < 256) {
-        Log("preset: StorePreset on \"%s\" (preset at %p)",
-            effect != nullptr && effect->label_narrow[0] != '\0' ? effect->label_narrow
-                                                                 : "an effect",
-            preset);
+bool BridgeLoadPreset(void *self, void *preset) {
+  static std::atomic<int> seen{0};
+  const int index = seen.fetch_add(1);
+  ClaimedEffect *const effect = FindEffectAny(self);
+  if (index < 256) {
+    Log("preset: LoadPreset on \"%s\" (preset at %p)",
+        effect != nullptr && effect->label_narrow[0] != '\0'
+            ? effect->label_narrow
+            : "an effect",
+        preset);
+    if (index < 8) {
+      LogPresetWords("preset: load ", preset);
     }
-    bool answered = false;
-    if (g_original_store_preset != nullptr) {
-        answered = reinterpret_cast<bool (*)(void*, void*)>(g_original_store_preset)(self, preset);
+    if (index < 2) {
+      LogPresetTable("preset: load ", preset);
     }
-    if (index < 256) {
-        Log("preset: StorePreset returned %s", answered ? "true" : "false");
-        if (index < 8) { LogPresetWords("preset: store", preset); }
-        if (index < 2) {
-            LogPresetTable("preset: store", preset);
-        }
-    }
-    // Only when the carrier wrote a payload of its own. A false answer means Resolve is about to
-    // skip this effect, and appending to a buffer nobody reads would be a leak with a log line.
-    if (answered) {
-        AttachPluginChunk(effect, preset);
-    }
-    return answered;
+  }
+  // Hide our tail from the stock parser for the length of its call, then give
+  // the plugin its settings back. The stock call goes first because it restores
+  // the carrier, and the carrier must not be able to overwrite what the plugin
+  // was told afterwards.
+  size_t carrier_length = 0;
+  const bool carried = TakeAttachedChunk(effect, preset, &carrier_length);
+  unsigned long full_length = 0;
+  if (carried) {
+    auto *const words = static_cast<unsigned long *>(preset);
+    full_length = words[1];
+    words[1] = static_cast<unsigned long>(carrier_length);
+  }
+
+  bool answered = false;
+  if (g_original_load_preset != nullptr) {
+    answered = reinterpret_cast<bool (*)(void *, void *)>(
+        g_original_load_preset)(self, preset);
+  }
+
+  if (carried) {
+    static_cast<unsigned long *>(preset)[1] = full_length;
+  }
+  if (index < 256) {
+    Log("preset: LoadPreset returned %s", answered ? "true" : "false");
+  }
+  return answered;
 }
 
-bool BridgeLoadPreset(void* self, void* preset)
-{
-    static std::atomic<int> seen{0};
-    const int index = seen.fetch_add(1);
-    ClaimedEffect* const effect = FindEffectAny(self);
-    if (index < 256) {
-        Log("preset: LoadPreset on \"%s\" (preset at %p)",
-            effect != nullptr && effect->label_narrow[0] != '\0' ? effect->label_narrow
-                                                                 : "an effect",
-            preset);
-        if (index < 8) { LogPresetWords("preset: load ", preset); }
-        if (index < 2) {
-            LogPresetTable("preset: load ", preset);
-        }
+void PatchDelayClassVtable() {
+  if (g_stock_handle == nullptr) {
+    return;
+  }
+
+  auto *const vtable =
+      static_cast<unsigned char *>(dlsym(g_stock_handle, kDelayVtableSymbol));
+  if (vtable == nullptr) {
+    Log("audio hook skipped: %s not found", kDelayVtableSymbol);
+    return;
+  }
+
+  g_stock_vtable = vtable;
+  g_our_vtable =
+      static_cast<unsigned char *>(std::aligned_alloc(16, kVtableBytes));
+  if (g_our_vtable == nullptr) {
+    Log("vtable copy failed: no memory - the stock vtable is left untouched");
+    return;
+  }
+  std::memcpy(g_our_vtable, vtable, kVtableBytes);
+  Log("vtable copied: stock %p, ours %p, %zu bytes", vtable, g_our_vtable,
+      kVtableBytes);
+
+  // The primary Process slot is OFF by default.
+  //
+  // Resolve reaches Process through the AudioPlugin thunk at +0x690, and that
+  // path has been stable all evening. The primary slot at +0x4d0 only became
+  // reachable once the primary vptr was claimed, and the first run that claimed
+  // it died inside BridgeThunkProcessPrimary - the core dump named the frame,
+  // with libc's signal trampoline directly above it. Until that is understood,
+  // the slot Resolve actually uses is the only one hooked.
+  const bool primary =
+      EnabledByEnvironment("FXBRIDGE_PRIMARY_PROCESS")
+          ? PatchOurSlot(kProcessPrimaryOffset, &g_original_process_primary,
+                         reinterpret_cast<void *>(&BridgeThunkProcessPrimary))
+          : false;
+  const bool secondary =
+      PatchOurSlot(kProcessThunkOffset, &g_original_process_thunk,
+                   reinterpret_cast<void *>(&BridgeThunkProcessSecondary));
+
+  const bool has_editor =
+      PatchOurSlot(kHasEditorOffset, &g_original_has_editor,
+                   reinterpret_cast<void *>(&BridgeHasEditor));
+  PatchOurSlot(kGetEffectEditOffset, &g_original_get_effect_edit,
+               reinterpret_cast<void *>(&BridgeGetEffectEdit));
+  PatchOurSlot(kInitializeEffectEditOffset, &g_original_initialize_editor,
+               reinterpret_cast<void *>(&BridgeInitializeEffectEdit));
+  PatchOurSlot(kCloseEffectEditOffset, &g_original_close_editor,
+               reinterpret_cast<void *>(&BridgeCloseEffectEdit));
+  const bool has_editor_thunk =
+      PatchOurSlot(kHasEditorThunkOffset, &g_original_has_editor_thunk,
+                   reinterpret_cast<void *>(&BridgeHasEditorThunk));
+  PatchOurSlot(kGetEffectEditThunkOffset, &g_original_get_effect_edit_thunk,
+               reinterpret_cast<void *>(&BridgeGetEffectEditThunk));
+  PatchOurSlot(kInitializeEffectEditThunkOffset,
+               &g_original_initialize_editor_thunk,
+               reinterpret_cast<void *>(&BridgeInitializeEffectEditThunk));
+  PatchOurSlot(kCloseEffectEditThunkOffset, &g_original_close_editor_thunk,
+               reinterpret_cast<void *>(&BridgeCloseEffectEditThunk));
+
+  if (EnabledByEnvironment("FXBRIDGE_EDITOR_TRACE")) {
+    for (TraceSlot &entry : g_trace_slots) {
+      PatchOurSlot(entry.offset, entry.original, entry.replacement);
     }
-    // Hide our tail from the stock parser for the length of its call, then give the plugin its
-    // settings back. The stock call goes first because it restores the carrier, and the carrier
-    // must not be able to overwrite what the plugin was told afterwards.
-    size_t carrier_length = 0;
-    const bool carried = TakeAttachedChunk(effect, preset, &carrier_length);
-    unsigned long full_length = 0;
-    if (carried) {
-        auto* const words = static_cast<unsigned long*>(preset);
-        full_length = words[1];
-        words[1] = static_cast<unsigned long>(carrier_length);
+  }
+
+  // The latency and reset probe. Measures, changes nothing: every slot calls
+  // the stock body and returns its result untouched. On by default in this
+  // build because that is what it is for; FXBRIDGE_LATENCY_PROBE=0 turns it
+  // off.
+  if (EnabledByEnvironment("FXBRIDGE_LATENCY_PROBE", true)) {
+    int installed = 0;
+    for (ProbeSlot &entry : g_probe_slots) {
+      if (PatchOurSlot(entry.offset, entry.original, entry.replacement)) {
+        ++installed;
+      }
     }
+    Log("probe: latency and reset probe on, %d slots - see "
+        "docs/latency-and-reset.md",
+        installed);
+  }
 
-    bool answered = false;
-    if (g_original_load_preset != nullptr) {
-        answered = reinterpret_cast<bool (*)(void*, void*)>(g_original_load_preset)(self, preset);
+  // After the probe, so the answer wins the slot and the probe becomes the
+  // fallback behind it. Both reset offsets are taken even though only the thunk
+  // was ever seen to fire: the one that does not fire costs a pointer, and a
+  // build where the other one fires would otherwise be a silent no-op.
+  if (EnabledByEnvironment("FXBRIDGE_LATENCY", true)) {
+    PatchOurSlot(kGetPluginLatencyOffset, &g_original_get_plugin_latency,
+                 reinterpret_cast<void *>(&BridgeGetPluginLatency));
+    Log("latency: reporting the plugin's own latency");
+  }
+
+  // Separately switchable, and that is the whole reason it is a second
+  // variable.
+  //
+  // With the desync fixed, one symptom is left: a few hundred milliseconds of
+  // silence when playback starts, which an export does not have. Two
+  // candidates. Either this reset empties a plugin that then has nothing to
+  // output for its own latency - 6144 samples is 128 ms, and a stack of them is
+  // a few hundred - or Resolve does not run the effect ahead of the playhead at
+  // transport start, in which case the silence is there no matter who reset
+  // what.
+  //
+  // One switch tells them apart. FXBRIDGE_RESET=0 keeps the latency answer and
+  // drops the reset: if the gap survives that, it was never ours. DEFAULT OFF
+  // since v0.2.10, because this crashed Resolve.
+  //
+  // A VST2 through yabridge aborts during project load with "terminate called
+  // without an active exception" and seven frames inside libyabridge-vst2.so.
+  // Confirmed by switching only this: with the reset off the same project
+  // opens, smartEQ4 loads, and the latency fix keeps working
+  // (`"PodcastPlugins TRACK" reports 5279 samples`).
+  //
+  // The cause is almost certainly the thread. The reset is deferred to the top
+  // of the next Process on purpose - no processing is in flight there, and CLAP
+  // names the audio thread as where a reset belongs. But for VST2 that means
+  // dispatching effStopProcess and effStartProcess from the audio thread into a
+  // Wine IPC bridge, and yabridge expects most dispatcher traffic on the main
+  // thread. The reasoning was right for VST3 and CLAP and was generalised to
+  // VST2 without evidence.
+  //
+  // Off until that is fixed properly rather than guessed at. FXBRIDGE_RESET=1
+  // restores it, which is how the fix will be tested.
+  if (EnabledByEnvironment("FXBRIDGE_RESET", false)) {
+    PatchOurSlot(kResetHistoryOffset, &g_original_reset_history,
+                 reinterpret_cast<void *>(&BridgeResetHistory));
+    PatchOurSlot(kResetHistoryThunkOffset, &g_original_reset_history_thunk,
+                 reinterpret_cast<void *>(&BridgeResetHistoryThunk));
+    Log("latency: forwarding a locate to the plugin");
+  } else {
+    Log("latency: the locate is not forwarded - off by default since v0.2.10, "
+        "FXBRIDGE_RESET=1 turns it back on");
+  }
+  // The name hooks are OUT. GetEffectName returns a string by value, so the ABI
+  // puts the hidden return buffer in rdi and `this` in rsi. Calling it as
+  // `const void* (*)(void*)` hands the object pointer over as a write buffer -
+  // the probe answered stack addresses like 0x7ffc433d9560, which is what gave
+  // it away. Do not reinstate these without reading the disassembly for an sret
+  // first.
+
+  // After the trace loop, so the no-op wins the slot rather than the tracer.
+  if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true)) {
+    PatchOurSlot(kGenerateUserInterfaceOffset, nullptr,
+                 reinterpret_cast<void *>(&BridgeGenerateUserInterface));
+    Log("empty panel is ON - GenerateUserInterface is a no-op in our vtable");
+  }
+
+  // After the trace loop for the same reason the empty panel is: the tracer
+  // holds these two slots as well, and whichever is patched last saves the
+  // other as its original. Chaining through the tracer is fine - it reports and
+  // tail-jumps, so the return value is the stock one - and it means the probe
+  // does not cost the trace lines.
+  g_mark_dirty = EnabledByEnvironment("FXBRIDGE_MARK_DIRTY");
+  if (g_mark_dirty) {
+    Log("dirty: FXBRIDGE_MARK_DIRTY is ON - a changed plugin sets its own "
+        "dirty flag");
+  }
+  g_param_probe = EnabledByEnvironment("FXBRIDGE_PARAM_PROBE");
+  if (g_param_probe) {
+    if (const char *const seed = std::getenv("FXBRIDGE_PROBE_SEED")) {
+      const float parsed = std::strtof(seed, nullptr);
+      if (parsed > 0.0f && parsed < 1.0f) {
+        g_probe_seed = parsed;
+      }
     }
-
-    if (carried) {
-        static_cast<unsigned long*>(preset)[1] = full_length;
+    Log("probe: this run seeds the four with %.6f, %.6f, %.6f, %.6f",
+        static_cast<double>(ProbeSeed(0)), static_cast<double>(ProbeSeed(1)),
+        static_cast<double>(ProbeSeed(2)), static_cast<double>(ProbeSeed(3)));
+    const bool count =
+        PatchOurSlot(kGetNumberOfParametersOffset, &g_original_parameter_count,
+                     reinterpret_cast<void *>(&BridgeParameterCount));
+    const bool count_thunk = PatchOurSlot(
+        kGetNumberOfParametersThunkOffset, &g_original_parameter_count_thunk,
+        reinterpret_cast<void *>(&BridgeParameterCountThunk));
+    const bool value =
+        PatchOurSlot(kGetParameterValueOffset, &g_original_parameter_value,
+                     reinterpret_cast<void *>(&BridgeParameterValue));
+    const bool value_thunk = PatchOurSlot(
+        kGetParameterValueThunkOffset, &g_original_parameter_value_thunk,
+        reinterpret_cast<void *>(&BridgeParameterValueThunk));
+    const bool setter = PatchOurSlot(
+        kSetParameterValueThunkOffset, &g_original_set_parameter_thunk,
+        reinterpret_cast<void *>(&BridgeSetParameterThunk));
+    const bool control =
+        PatchOurSlot(kGetControlTypeOffset, &g_original_control_type,
+                     reinterpret_cast<void *>(&BridgeControlType));
+    const bool control_thunk =
+        PatchOurSlot(kGetControlTypeThunkOffset, &g_original_control_type_thunk,
+                     reinterpret_cast<void *>(&BridgeControlTypeThunk));
+    const bool name =
+        PatchOurSlot(kGetParameterNameOffset, &g_original_parameter_name,
+                     reinterpret_cast<void *>(&BridgeParameterName));
+    const bool name_thunk = PatchOurSlot(
+        kGetParameterNameThunkOffset, &g_original_parameter_name_thunk,
+        reinterpret_cast<void *>(&BridgeParameterNameThunk));
+    Log("probe: names %s/%s", name ? "primary" : "FAILED",
+        name_thunk ? "thunk" : "FAILED");
+    Log("probe: FXBRIDGE_PARAM_PROBE is ON - count %s/%s, value %s/%s, setter "
+        "%s, type %s/%s",
+        count ? "primary" : "FAILED", count_thunk ? "thunk" : "FAILED",
+        value ? "primary" : "FAILED", value_thunk ? "thunk" : "FAILED",
+        setter ? "thunk" : "FAILED", control ? "primary" : "FAILED",
+        control_thunk ? "thunk" : "FAILED");
+    g_probe_notify = EnabledByEnvironment("FXBRIDGE_PROBE_NOTIFY");
+    if (g_probe_notify) {
+      Log("probe: FXBRIDGE_PROBE_NOTIFY is ON - this crashed Resolve on "
+          "2026-08-29");
+      HostMainRegister(&g_probe_notifier, 1000);
     }
-    if (index < 256) {
-        Log("preset: LoadPreset returned %s", answered ? "true" : "false");
+  }
+
+  if (EnabledByEnvironment("FXBRIDGE_ALWAYS_DIRTY", true)) {
+    const bool watched = PatchOurSlot(kIsDirtyOffset, &g_original_is_dirty,
+                                      reinterpret_cast<void *>(&BridgeIsDirty));
+    Log("dirty: an effect of ours always answers IsDirty true - %s (+0xa70)",
+        watched ? "patched" : "FAILED");
+  }
+
+  // On by default. The trace half only forwards and logs; the state half,
+  // below, is what puts a hosted plugin's settings inside the Resolve project.
+  if (EnabledByEnvironment("FXBRIDGE_PRESET_TRACE", true)) {
+    const bool store =
+        PatchOurSlot(kStorePresetThunkOffset, &g_original_store_preset,
+                     reinterpret_cast<void *>(&BridgeStorePreset));
+    const bool load =
+        PatchOurSlot(kLoadPresetThunkOffset, &g_original_load_preset,
+                     reinterpret_cast<void *>(&BridgeLoadPreset));
+    Log("preset: watching the AudioPlugin slots - store %s (+0x990), load %s "
+        "(+0x998)",
+        store ? "patched" : "FAILED", load ? "patched" : "FAILED");
+
+    g_preset_state =
+        store && load && EnabledByEnvironment("FXBRIDGE_PRESET_STATE", true);
+    if (g_preset_state) {
+      ResolveArrayAllocator();
+      g_preset_state = g_array_new != nullptr && g_array_delete != nullptr;
     }
-    return answered;
-}
+    Log("preset: plugin settings travel in the project - %s "
+        "(FXBRIDGE_PRESET_STATE)",
+        g_preset_state ? "ON" : "off");
+  }
 
-void PatchDelayClassVtable()
-{
-    if (g_stock_handle == nullptr) {
-        return;
-    }
-
-    auto* const vtable = static_cast<unsigned char*>(dlsym(g_stock_handle, kDelayVtableSymbol));
-    if (vtable == nullptr) {
-        Log("audio hook skipped: %s not found", kDelayVtableSymbol);
-        return;
-    }
-
-    g_stock_vtable = vtable;
-    g_our_vtable = static_cast<unsigned char*>(std::aligned_alloc(16, kVtableBytes));
-    if (g_our_vtable == nullptr) {
-        Log("vtable copy failed: no memory - the stock vtable is left untouched");
-        return;
-    }
-    std::memcpy(g_our_vtable, vtable, kVtableBytes);
-    Log("vtable copied: stock %p, ours %p, %zu bytes", vtable, g_our_vtable, kVtableBytes);
-
-
-    // The primary Process slot is OFF by default.
-    //
-    // Resolve reaches Process through the AudioPlugin thunk at +0x690, and that path has been
-    // stable all evening. The primary slot at +0x4d0 only became reachable once the primary vptr
-    // was claimed, and the first run that claimed it died inside BridgeThunkProcessPrimary - the
-    // core dump named the frame, with libc's signal trampoline directly above it. Until that is
-    // understood, the slot Resolve actually uses is the only one hooked.
-    const bool primary =
-        EnabledByEnvironment("FXBRIDGE_PRIMARY_PROCESS")
-            ? PatchOurSlot(kProcessPrimaryOffset, &g_original_process_primary,
-                           reinterpret_cast<void*>(&BridgeThunkProcessPrimary))
-            : false;
-    const bool secondary = PatchOurSlot(kProcessThunkOffset,
-                                           &g_original_process_thunk,
-                                           reinterpret_cast<void*>(&BridgeThunkProcessSecondary));
-
-    const bool has_editor = PatchOurSlot(kHasEditorOffset, &g_original_has_editor,
-                                           reinterpret_cast<void*>(&BridgeHasEditor));
-    PatchOurSlot(kGetEffectEditOffset, &g_original_get_effect_edit,
-                    reinterpret_cast<void*>(&BridgeGetEffectEdit));
-    PatchOurSlot(kInitializeEffectEditOffset, &g_original_initialize_editor,
-                    reinterpret_cast<void*>(&BridgeInitializeEffectEdit));
-    PatchOurSlot(kCloseEffectEditOffset, &g_original_close_editor,
-                    reinterpret_cast<void*>(&BridgeCloseEffectEdit));
-    const bool has_editor_thunk = PatchOurSlot(kHasEditorThunkOffset,
-                                                 &g_original_has_editor_thunk,
-                                                 reinterpret_cast<void*>(&BridgeHasEditorThunk));
-    PatchOurSlot(kGetEffectEditThunkOffset, &g_original_get_effect_edit_thunk,
-                    reinterpret_cast<void*>(&BridgeGetEffectEditThunk));
-    PatchOurSlot(kInitializeEffectEditThunkOffset, &g_original_initialize_editor_thunk,
-                    reinterpret_cast<void*>(&BridgeInitializeEffectEditThunk));
-    PatchOurSlot(kCloseEffectEditThunkOffset, &g_original_close_editor_thunk,
-                    reinterpret_cast<void*>(&BridgeCloseEffectEditThunk));
-
-    for (TraceSlot& entry : g_trace_slots) {
-        PatchOurSlot(entry.offset, entry.original, entry.replacement);
-    }
-
-    // The latency and reset probe. Measures, changes nothing: every slot calls the stock body and
-    // returns its result untouched. On by default in this build because that is what it is for;
-    // FXBRIDGE_LATENCY_PROBE=0 turns it off.
-    if (EnabledByEnvironment("FXBRIDGE_LATENCY_PROBE", true)) {
-        int installed = 0;
-        for (ProbeSlot& entry : g_probe_slots) {
-            if (PatchOurSlot(entry.offset, entry.original, entry.replacement)) {
-                ++installed;
-            }
-        }
-        Log("probe: latency and reset probe on, %d slots - see docs/latency-and-reset.md",
-            installed);
-    }
-
-    // After the probe, so the answer wins the slot and the probe becomes the fallback behind it.
-    // Both reset offsets are taken even though only the thunk was ever seen to fire: the one that
-    // does not fire costs a pointer, and a build where the other one fires would otherwise be a
-    // silent no-op.
-    if (EnabledByEnvironment("FXBRIDGE_LATENCY", true)) {
-        PatchOurSlot(kGetPluginLatencyOffset, &g_original_get_plugin_latency,
-                     reinterpret_cast<void*>(&BridgeGetPluginLatency));
-        Log("latency: reporting the plugin's own latency");
-    }
-
-    // Separately switchable, and that is the whole reason it is a second variable.
-    //
-    // With the desync fixed, one symptom is left: a few hundred milliseconds of silence when
-    // playback starts, which an export does not have. Two candidates. Either this reset empties a
-    // plugin that then has nothing to output for its own latency - 6144 samples is 128 ms, and a
-    // stack of them is a few hundred - or Resolve does not run the effect ahead of the playhead at
-    // transport start, in which case the silence is there no matter who reset what.
-    //
-    // One switch tells them apart. FXBRIDGE_RESET=0 keeps the latency answer and drops the reset:
-    // if the gap survives that, it was never ours.
-    // DEFAULT OFF since v0.2.10, because this crashed Resolve.
-    //
-    // A VST2 through yabridge aborts during project load with "terminate called without an active
-    // exception" and seven frames inside libyabridge-vst2.so. Confirmed by switching only this:
-    // with the reset off the same project opens, smartEQ4 loads, and the latency fix keeps working
-    // (`"PodcastPlugins TRACK" reports 5279 samples`).
-    //
-    // The cause is almost certainly the thread. The reset is deferred to the top of the next
-    // Process on purpose - no processing is in flight there, and CLAP names the audio thread as
-    // where a reset belongs. But for VST2 that means dispatching effStopProcess and effStartProcess
-    // from the audio thread into a Wine IPC bridge, and yabridge expects most dispatcher traffic on
-    // the main thread. The reasoning was right for VST3 and CLAP and was generalised to VST2
-    // without evidence.
-    //
-    // Off until that is fixed properly rather than guessed at. FXBRIDGE_RESET=1 restores it, which
-    // is how the fix will be tested.
-    if (EnabledByEnvironment("FXBRIDGE_RESET", false)) {
-        PatchOurSlot(kResetHistoryOffset, &g_original_reset_history,
-                     reinterpret_cast<void*>(&BridgeResetHistory));
-        PatchOurSlot(kResetHistoryThunkOffset, &g_original_reset_history_thunk,
-                     reinterpret_cast<void*>(&BridgeResetHistoryThunk));
-        Log("latency: forwarding a locate to the plugin");
-    } else {
-        Log("latency: the locate is not forwarded - off by default since v0.2.10, "
-            "FXBRIDGE_RESET=1 turns it back on");
-    }
-    // The name hooks are OUT. GetEffectName returns a string by value, so the ABI puts the hidden
-    // return buffer in rdi and `this` in rsi. Calling it as `const void* (*)(void*)` hands the
-    // object pointer over as a write buffer - the probe answered stack addresses like
-    // 0x7ffc433d9560, which is what gave it away. Do not reinstate these without reading the
-    // disassembly for an sret first.
-
-    // After the trace loop, so the no-op wins the slot rather than the tracer.
-    if (EnabledByEnvironment("FXBRIDGE_EMPTY_PANEL", true)) {
-        PatchOurSlot(kGenerateUserInterfaceOffset, nullptr,
-                     reinterpret_cast<void*>(&BridgeGenerateUserInterface));
-        Log("empty panel is ON - GenerateUserInterface is a no-op in our vtable");
-    }
-
-    // After the trace loop for the same reason the empty panel is: the tracer holds these two
-    // slots as well, and whichever is patched last saves the other as its original. Chaining
-    // through the tracer is fine - it reports and tail-jumps, so the return value is the stock
-    // one - and it means the probe does not cost the trace lines.
-    g_mark_dirty = EnabledByEnvironment("FXBRIDGE_MARK_DIRTY");
-    if (g_mark_dirty) {
-        Log("dirty: FXBRIDGE_MARK_DIRTY is ON - a changed plugin sets its own dirty flag");
-    }
-    g_param_probe = EnabledByEnvironment("FXBRIDGE_PARAM_PROBE");
-    if (g_param_probe) {
-        if (const char* const seed = std::getenv("FXBRIDGE_PROBE_SEED")) {
-            const float parsed = std::strtof(seed, nullptr);
-            if (parsed > 0.0f && parsed < 1.0f) {
-                g_probe_seed = parsed;
-            }
-        }
-        Log("probe: this run seeds the four with %.6f, %.6f, %.6f, %.6f",
-            static_cast<double>(ProbeSeed(0)), static_cast<double>(ProbeSeed(1)),
-            static_cast<double>(ProbeSeed(2)), static_cast<double>(ProbeSeed(3)));
-        const bool count = PatchOurSlot(kGetNumberOfParametersOffset, &g_original_parameter_count,
-                                        reinterpret_cast<void*>(&BridgeParameterCount));
-        const bool count_thunk =
-            PatchOurSlot(kGetNumberOfParametersThunkOffset, &g_original_parameter_count_thunk,
-                         reinterpret_cast<void*>(&BridgeParameterCountThunk));
-        const bool value = PatchOurSlot(kGetParameterValueOffset, &g_original_parameter_value,
-                                        reinterpret_cast<void*>(&BridgeParameterValue));
-        const bool value_thunk =
-            PatchOurSlot(kGetParameterValueThunkOffset, &g_original_parameter_value_thunk,
-                         reinterpret_cast<void*>(&BridgeParameterValueThunk));
-        const bool setter =
-            PatchOurSlot(kSetParameterValueThunkOffset, &g_original_set_parameter_thunk,
-                         reinterpret_cast<void*>(&BridgeSetParameterThunk));
-        const bool control = PatchOurSlot(kGetControlTypeOffset, &g_original_control_type,
-                                          reinterpret_cast<void*>(&BridgeControlType));
-        const bool control_thunk =
-            PatchOurSlot(kGetControlTypeThunkOffset, &g_original_control_type_thunk,
-                         reinterpret_cast<void*>(&BridgeControlTypeThunk));
-        const bool name = PatchOurSlot(kGetParameterNameOffset, &g_original_parameter_name,
-                                       reinterpret_cast<void*>(&BridgeParameterName));
-        const bool name_thunk =
-            PatchOurSlot(kGetParameterNameThunkOffset, &g_original_parameter_name_thunk,
-                         reinterpret_cast<void*>(&BridgeParameterNameThunk));
-        Log("probe: names %s/%s", name ? "primary" : "FAILED", name_thunk ? "thunk" : "FAILED");
-        Log("probe: FXBRIDGE_PARAM_PROBE is ON - count %s/%s, value %s/%s, setter %s, type %s/%s",
-            count ? "primary" : "FAILED", count_thunk ? "thunk" : "FAILED",
-            value ? "primary" : "FAILED", value_thunk ? "thunk" : "FAILED",
-            setter ? "thunk" : "FAILED",
-            control ? "primary" : "FAILED", control_thunk ? "thunk" : "FAILED");
-        g_probe_notify = EnabledByEnvironment("FXBRIDGE_PROBE_NOTIFY");
-        if (g_probe_notify) {
-            Log("probe: FXBRIDGE_PROBE_NOTIFY is ON - this crashed Resolve on 2026-08-29");
-            HostMainRegister(&g_probe_notifier, 1000);
-        }
-    }
-
-    if (EnabledByEnvironment("FXBRIDGE_ALWAYS_DIRTY", true)) {
-        const bool watched = PatchOurSlot(kIsDirtyOffset, &g_original_is_dirty,
-                                          reinterpret_cast<void*>(&BridgeIsDirty));
-        Log("dirty: an effect of ours always answers IsDirty true - %s (+0xa70)",
-            watched ? "patched" : "FAILED");
-    }
-
-    // On by default. The trace half only forwards and logs; the state half, below, is what puts
-    // a hosted plugin's settings inside the Resolve project.
-    if (EnabledByEnvironment("FXBRIDGE_PRESET_TRACE", true)) {
-        const bool store = PatchOurSlot(kStorePresetThunkOffset, &g_original_store_preset,
-                                        reinterpret_cast<void*>(&BridgeStorePreset));
-        const bool load = PatchOurSlot(kLoadPresetThunkOffset, &g_original_load_preset,
-                                       reinterpret_cast<void*>(&BridgeLoadPreset));
-        Log("preset: watching the AudioPlugin slots - store %s (+0x990), load %s (+0x998)",
-            store ? "patched" : "FAILED", load ? "patched" : "FAILED");
-
-        g_preset_state = store && load && EnabledByEnvironment("FXBRIDGE_PRESET_STATE", true);
-        if (g_preset_state) {
-            ResolveArrayAllocator();
-            g_preset_state = g_array_new != nullptr && g_array_delete != nullptr;
-        }
-        Log("preset: plugin settings travel in the project - %s (FXBRIDGE_PRESET_STATE)",
-            g_preset_state ? "ON" : "off");
-    }
-
+  if (EnabledByEnvironment("FXBRIDGE_EDITOR_TRACE")) {
     Log("editor trace installed on %zu slots",
         sizeof(g_trace_slots) / sizeof(g_trace_slots[0]));
+  }
 
-    Log("editor hooks installed - primary %s, AudioPlugin base %s",
-        has_editor ? "patched" : "FAILED", has_editor_thunk ? "patched" : "FAILED");
+  Log("editor hooks installed - primary %s, AudioPlugin base %s",
+      has_editor ? "patched" : "FAILED",
+      has_editor_thunk ? "patched" : "FAILED");
 
-    const bool knob = PatchOurSlot(kSetParameterValueOffset,
-                                      &g_original_set_parameter,
-                                      reinterpret_cast<void*>(&BridgeThunkSetParameter));
-    Log("knob hook on BMDStereoDelay::SetParameterValue - %s (%p)",
-        knob ? "patched" : "FAILED", g_original_set_parameter);
+  const bool knob =
+      PatchOurSlot(kSetParameterValueOffset, &g_original_set_parameter,
+                   reinterpret_cast<void *>(&BridgeThunkSetParameter));
+  Log("knob hook on BMDStereoDelay::SetParameterValue - %s (%p)",
+      knob ? "patched" : "FAILED", g_original_set_parameter);
 
-    Log("audio hook on BMDStereoDelay::Process - primary %s (%p), thunk %s (%p)",
-        primary ? "patched" : "off", g_original_process_primary,
-        secondary ? "patched" : "FAILED", g_original_process_thunk);
-    Log("audio: a hosted block over %lld ms is logged by name (FXBRIDGE_SLOW_MS)",
-        SlowBlockMicroseconds() / 1000);
+  Log("audio hook on BMDStereoDelay::Process - primary %s (%p), thunk %s (%p)",
+      primary ? "patched" : "off", g_original_process_primary,
+      secondary ? "patched" : "FAILED", g_original_process_thunk);
+  Log("audio: a hosted block over %lld ms is logged by name (FXBRIDGE_SLOW_MS)",
+      SlowBlockMicroseconds() / 1000);
 }
 
-}  // namespace
+} // namespace
 
-extern "C" void* GetBMDPluginInterface()
-{
-    static void* const interface_ptr = [] () -> void* {
-        void* const stock = LoadStockInterface();
-        if (stock == nullptr) {
-            return nullptr;
-        }
+extern "C" void *GetBMDPluginInterface() {
+  static void *const interface_ptr = []() -> void * {
+    void *const stock = LoadStockInterface();
+    if (stock == nullptr) {
+      return nullptr;
+    }
 
-        void** const stock_vtable = *reinterpret_cast<void***>(stock);
-        const int version = reinterpret_cast<GetVersionFn>(stock_vtable[kGetPluginInterfaceVersion])(stock);
-        Log("stock interface at %p, version %d", stock, version);
-        if (version != kExpectedInterfaceVersion) {
-            Log("unexpected interface version, forwarding untouched");
-            return stock;
-        }
+    void **const stock_vtable = *reinterpret_cast<void ***>(stock);
+    const int version = reinterpret_cast<GetVersionFn>(
+        stock_vtable[kGetPluginInterfaceVersion])(stock);
+    Log("stock interface at %p, version %d", stock, version);
+    if (version != kExpectedInterfaceVersion) {
+      Log("unexpected interface version, forwarding untouched");
+      return stock;
+    }
 
-        // A Resolve whose member layout cannot be read with certainty is left alone, not written
-        // to on a guess. 21.1.2 moved them all by eight; src/member_layout.h.
-        if (!ReadMemberLayout(g_stock_handle, &g_layout, Log)) {
-            Log("member layout unreadable, forwarding untouched");
-            return stock;
-        }
+    // A Resolve whose member layout cannot be read with certainty is left
+    // alone, not written to on a guess. 21.1.2 moved them all by eight;
+    // src/member_layout.h.
+    if (!ReadMemberLayout(g_stock_handle, &g_layout, Log)) {
+      Log("member layout unreadable, forwarding untouched");
+      return stock;
+    }
 
-        g_vtable[0] = stock_vtable[-2];  // offset-to-top
-        g_vtable[1] = stock_vtable[-1];  // typeinfo
-        for (int slot = 0; slot < kSlotCount; ++slot) {
-            g_vtable[2 + slot] = stock_vtable[slot];
-        }
+    g_vtable[0] = stock_vtable[-2]; // offset-to-top
+    g_vtable[1] = stock_vtable[-1]; // typeinfo
+    for (int slot = 0; slot < kSlotCount; ++slot) {
+      g_vtable[2 + slot] = stock_vtable[slot];
+    }
 
-        g_original_query_plugin_list = stock_vtable[kQueryPluginList];
-        g_original_create_plugin_instance = stock_vtable[kCreatePluginInstance];
-        g_vtable[2 + kQueryPluginList] = reinterpret_cast<void*>(&BridgeThunkQueryPluginList);
-        g_vtable[2 + kCreatePluginInstance] = reinterpret_cast<void*>(&BridgeThunkCreatePluginInstance);
+    g_original_query_plugin_list = stock_vtable[kQueryPluginList];
+    g_original_create_plugin_instance = stock_vtable[kCreatePluginInstance];
+    g_vtable[2 + kQueryPluginList] =
+        reinterpret_cast<void *>(&BridgeThunkQueryPluginList);
+    g_vtable[2 + kCreatePluginInstance] =
+        reinterpret_cast<void *>(&BridgeThunkCreatePluginInstance);
 
-        if (!MakeWritable(stock)) {
-            Log("cannot install our vtable, forwarding untouched");
-            return stock;
-        }
-        *reinterpret_cast<void***>(stock) = &g_vtable[2];
-        g_interface = stock;
-        PatchDelayClassVtable();
-        // Resolve's own lock order inversion, repaired before a single plugin is loaded. It is
-        // not our bug and it is not our lock, but our plugins are what make it reachable:
-        // docs/freeze-deadlock.md.
-        InstallChainLockFix(g_stock_handle, Log);
-        LoadConfiguredPlugin();
+    if (!MakeWritable(stock)) {
+      Log("cannot install our vtable, forwarding untouched");
+      return stock;
+    }
+    *reinterpret_cast<void ***>(stock) = &g_vtable[2];
+    g_interface = stock;
+    PatchDelayClassVtable();
+    // Resolve's own lock order inversion, repaired before a single plugin is
+    // loaded. It is not our bug and it is not our lock, but our plugins are
+    // what make it reachable: docs/freeze-deadlock.md.
+    InstallChainLockFix(g_stock_handle, Log);
+    LoadConfiguredPlugin();
 
-        Log("our vtable installed, version reads %d",
-            reinterpret_cast<GetVersionFn>(g_vtable[2 + kGetPluginInterfaceVersion])(stock));
-        return stock;
-    }();
+    Log("our vtable installed, version reads %d",
+        reinterpret_cast<GetVersionFn>(
+            g_vtable[2 + kGetPluginInterfaceVersion])(stock));
+    return stock;
+  }();
 
-    return interface_ptr;
+  return interface_ptr;
 }
 
-// See the note in plugin_instance.h. Capped hard: this calls into Resolve from the plugin's
-// own thread, which is the shape of the deadlock that cost v0.1.1, and eight calls are enough to
-// answer the question.
-void BridgeParameterChangedByEditor(HostedPlugin* plugin, unsigned int index)
-{
-    static std::atomic<int> sent{0};
-    if (!EnabledByEnvironment("FXBRIDGE_NOTIFY_PARAM") || sent.load() >= 8) {
-        return;
+// See the note in plugin_instance.h. Capped hard: this calls into Resolve from
+// the plugin's own thread, which is the shape of the deadlock that cost v0.1.1,
+// and eight calls are enough to answer the question.
+void BridgeParameterChangedByEditor(HostedPlugin *plugin, unsigned int index) {
+  static std::atomic<int> sent{0};
+  if (!EnabledByEnvironment("FXBRIDGE_NOTIFY_PARAM") || sent.load() >= 8) {
+    return;
+  }
+  const size_t count = g_effect_count.load();
+  for (size_t entry = 0; entry < count; ++entry) {
+    ClaimedEffect &effect = g_effects[entry];
+    if (effect.plugin != plugin || effect.primary_base == nullptr) {
+      continue;
     }
-    const size_t count = g_effect_count.load();
-    for (size_t entry = 0; entry < count; ++entry) {
-        ClaimedEffect& effect = g_effects[entry];
-        if (effect.plugin != plugin || effect.primary_base == nullptr) {
-            continue;
-        }
-        using Notify = void (*)(void*, unsigned int);
-        auto* const notify = *reinterpret_cast<Notify*>(g_stock_vtable + 0x0c0);
-        if (notify == nullptr) {
-            return;
-        }
-        // Logged on both sides, so a call that never returns is visible as a missing second line.
-        sent.fetch_add(1);
-        Log("notify: telling Resolve parameter %u moved", index);
-        notify(effect.primary_base, index);
-        Log("notify: returned");
-        return;
+    using Notify = void (*)(void *, unsigned int);
+    auto *const notify = *reinterpret_cast<Notify *>(g_stock_vtable + 0x0c0);
+    if (notify == nullptr) {
+      return;
     }
+    // Logged on both sides, so a call that never returns is visible as a
+    // missing second line.
+    sent.fetch_add(1);
+    Log("notify: telling Resolve parameter %u moved", index);
+    notify(effect.primary_base, index);
+    Log("notify: returned");
+    return;
+  }
 }
